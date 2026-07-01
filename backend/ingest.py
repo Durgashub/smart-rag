@@ -6,6 +6,15 @@ Usage:
 
 Reads from:  docs/<session_id>/
 Writes to:   vector_store/<session_id>/
+
+Supported file types:
+    .pdf   — pdfplumber + OCR fallback for scanned pages
+    .docx  — python-docx
+    .xlsx  — openpyxl (each sheet → text)
+    .csv   — plain text read
+    .txt   — plain text read
+    .md    — plain text read
+    others — attempt plain text read, skip silently if binary
 """
 
 import os
@@ -37,6 +46,14 @@ if TESSERACT_CMD:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 POPPLER_PATH = os.getenv("POPPLER_PATH") or None
 
+# All supported extensions — add more here as needed
+SUPPORTED_EXTENSIONS = {
+    ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv",
+    ".txt", ".md", ".pptx"
+}
+
+
+# ── Extractors ────────────────────────────────────────────────────────────────
 
 def _table_to_markdown(table_rows) -> str:
     rows = [[(cell or "").strip().replace("\n", " ") for cell in row] for row in table_rows if row]
@@ -77,7 +94,6 @@ def load_text_from_pdf(path: str) -> str:
             combined = text
             if table_blocks:
                 combined = (combined + "\n\n" + "\n\n".join(table_blocks)).strip()
-
             if len(combined) < MIN_TEXT_LEN_BEFORE_OCR:
                 try:
                     ocr_text = _ocr_page(path, i)
@@ -85,27 +101,130 @@ def load_text_from_pdf(path: str) -> str:
                         combined = ocr_text.strip()
                 except Exception as e:
                     print(f"  Warning: OCR failed on page {i} of {Path(path).name}: {e}")
-
             if combined:
                 page_texts.append(f"[Page {i}]\n{combined}")
-
     return "\n\n".join(page_texts)
 
 
 def load_text_from_docx(path: str) -> str:
-    from docx import Document
-    doc = Document(path)
-    return "\n\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+    try:
+        from docx import Document
+        doc = Document(path)
+        parts = []
+        for para in doc.paragraphs:
+            if para.text.strip():
+                parts.append(para.text.strip())
+        # Also extract tables from docx
+        for table in doc.tables:
+            rows = []
+            for row in table.rows:
+                rows.append([cell.text.strip() for cell in row.cells])
+            if rows:
+                parts.append(_table_to_markdown(rows))
+        return "\n\n".join(parts)
+    except Exception as e:
+        print(f"  Warning: Could not read docx {Path(path).name}: {e}")
+        return ""
+
+
+def load_text_from_xlsx(path: str) -> str:
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(path, data_only=True)
+        parts = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                row_data = [str(cell) if cell is not None else "" for cell in row]
+                if any(cell.strip() for cell in row_data):
+                    rows.append(row_data)
+            if rows:
+                parts.append(f"[Sheet: {sheet_name}]\n" + _table_to_markdown(rows))
+        return "\n\n".join(parts)
+    except ImportError:
+        print(f"  Warning: openpyxl not installed. Run: pip install openpyxl")
+        return ""
+    except Exception as e:
+        print(f"  Warning: Could not read xlsx {Path(path).name}: {e}")
+        return ""
+
+
+def load_text_from_pptx(path: str) -> str:
+    try:
+        from pptx import Presentation
+        prs = Presentation(path)
+        parts = []
+        for i, slide in enumerate(prs.slides, start=1):
+            slide_texts = []
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    slide_texts.append(shape.text.strip())
+            if slide_texts:
+                parts.append(f"[Slide {i}]\n" + "\n".join(slide_texts))
+        return "\n\n".join(parts)
+    except ImportError:
+        print(f"  Warning: python-pptx not installed. Run: pip install python-pptx")
+        return ""
+    except Exception as e:
+        print(f"  Warning: Could not read pptx {Path(path).name}: {e}")
+        return ""
+
+
+def load_text_from_csv(path: str) -> str:
+    try:
+        import csv
+        rows = []
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if any(cell.strip() for cell in row):
+                    rows.append(row)
+        if rows:
+            return _table_to_markdown(rows)
+        return ""
+    except Exception as e:
+        print(f"  Warning: Could not read csv {Path(path).name}: {e}")
+        return ""
 
 
 def load_text_from_file(path: str) -> str:
-    if path.lower().endswith(".pdf"):
-        return load_text_from_pdf(path)
-    if path.lower().endswith(".docx"):
-        return load_text_from_docx(path)
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()
+    ext = Path(path).suffix.lower()
 
+    if ext == ".pdf":
+        return load_text_from_pdf(path)
+
+    if ext == ".docx":
+        return load_text_from_docx(path)
+
+    if ext == ".doc":
+        print(f"  Warning: .doc format not supported directly. Convert to .docx for best results.")
+        return ""
+
+    if ext in {".xlsx", ".xls"}:
+        return load_text_from_xlsx(path)
+
+    if ext == ".csv":
+        return load_text_from_csv(path)
+
+    if ext == ".pptx":
+        return load_text_from_pptx(path)
+
+    # Plain text fallback for .txt, .md, and anything else
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        # Skip if it looks binary (lots of null bytes)
+        if content.count("\x00") > 10:
+            print(f"  Warning: {Path(path).name} appears to be binary, skipping.")
+            return ""
+        return content
+    except Exception as e:
+        print(f"  Warning: Could not read {Path(path).name}: {e}")
+        return ""
+
+
+# ── Chunk quality filter ──────────────────────────────────────────────────────
 
 def is_low_value_chunk(text: str) -> bool:
     stripped = text.strip()
@@ -122,6 +241,8 @@ def is_low_value_chunk(text: str) -> bool:
         return True
     return False
 
+
+# ── Chunking ──────────────────────────────────────────────────────────────────
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
@@ -153,6 +274,8 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     return [c for c in chunks if c]
 
 
+# ── Embeddings ────────────────────────────────────────────────────────────────
+
 def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
@@ -165,6 +288,8 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     return all_embeddings
 
 
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--session", required=True, help="Session ID to scope docs and vector store")
@@ -176,11 +301,16 @@ def main():
 
     os.makedirs(store_dir, exist_ok=True)
 
-    file_paths = glob.glob(f"{docs_dir}/**/*.*", recursive=True)
-    file_paths = [p for p in file_paths if p.lower().endswith((".txt", ".md", ".pdf"))]
+    # Pick up ALL files — filter by supported extension
+    all_files = glob.glob(f"{docs_dir}/**/*.*", recursive=True)
+    file_paths = [
+        p for p in all_files
+        if Path(p).suffix.lower() in SUPPORTED_EXTENSIONS
+    ]
 
     if not file_paths:
-        print(f"No files found in '{docs_dir}/'. Nothing to index.")
+        print(f"No supported files found in '{docs_dir}/'. Nothing to index.")
+        print(f"Supported types: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
         return
 
     all_chunks = []
@@ -188,17 +318,28 @@ def main():
     skipped_count = 0
 
     for path in file_paths:
-        print(f"Loading {path} ...")
+        ext = Path(path).suffix.lower()
+        print(f"Loading {path} ({ext}) ...")
         text = load_text_from_file(path)
+
+        if not text.strip():
+            print(f"  -> No text extracted, skipping.")
+            continue
+
         raw_chunks = chunk_text(text)
         chunks = [c for c in raw_chunks if not is_low_value_chunk(c)]
         skipped_count += len(raw_chunks) - len(chunks)
         print(f"  -> {len(chunks)} chunk(s) kept, {len(raw_chunks) - len(chunks)} skipped")
+
         for chunk in chunks:
             all_chunks.append(chunk)
             metadata.append({"source": Path(path).name, "text": chunk})
 
-    print(f"Total: {len(all_chunks)} chunks from {len(file_paths)} file(s) ({skipped_count} skipped).")
+    if not all_chunks:
+        print("No chunks produced. Check file contents.")
+        return
+
+    print(f"\nTotal: {len(all_chunks)} chunks from {len(file_paths)} file(s) ({skipped_count} skipped).")
     print("Generating embeddings...")
     embeddings = embed_texts(all_chunks)
 

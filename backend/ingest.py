@@ -92,9 +92,17 @@ def load_text_from_pdf(path: str) -> str:
     return "\n\n".join(page_texts)
 
 
+def load_text_from_docx(path: str) -> str:
+    from docx import Document
+    doc = Document(path)
+    return "\n\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+
+
 def load_text_from_file(path: str) -> str:
     if path.lower().endswith(".pdf"):
         return load_text_from_pdf(path)
+    if path.lower().endswith(".docx"):
+        return load_text_from_docx(path)
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return f.read()
 

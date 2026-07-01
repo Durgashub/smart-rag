@@ -108,11 +108,9 @@ async def upload_file(
 ):
     if not session_id:
         raise HTTPException(status_code=401, detail="No session. Call /api/session first.")
-
-    allowed = {".pdf", ".txt", ".md"}
+    
+    allowed = None  # Allow all file types
     suffix = Path(file.filename).suffix.lower()
-    if suffix not in allowed:
-        raise HTTPException(status_code=400, detail="Only PDF, TXT and MD files are allowed.")
 
     docs_dir, _ = get_session_dirs(session_id)
     destination = docs_dir / file.filename

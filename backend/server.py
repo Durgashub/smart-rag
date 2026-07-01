@@ -2,13 +2,14 @@ import sys
 import uuid
 import subprocess
 import re
+import json
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
-from typing import Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException, Cookie, Response
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from query import retrieve
@@ -125,39 +126,28 @@ ESTIMATED TIME TO BE COMPETITIVE: [X months]
 # ── Mode detection ────────────────────────────────────────────────────────────
 
 def detect_mode(question: str) -> str:
-    """Detect which mode to use based on the question."""
     q = question.lower()
-
-    # Resume analyzer
     if any(word in q for word in [
         "score", "rate my resume", "review my resume", "analyze my resume",
         "how good is", "rate it", "grade my", "evaluate my resume", "ats score"
     ]):
         return "analyzer"
-
-    # Cover letter
     if any(word in q for word in [
         "cover letter", "write a letter", "application letter", "motivational letter"
     ]):
         return "cover_letter"
-
-    # Skill gap
     if any(word in q for word in [
         "skill gap", "missing skills", "what skills", "skills i need",
         "am i qualified", "do i have", "match this job", "fit for this role",
         "missing for", "lack", "what am i missing"
     ]):
         return "skill_gap"
-
-    # Resume optimization
     if any(word in q for word in [
         "rewrite", "improve", "optimize", "enhance", "update", "fix",
         "make it better", "stronger", "rephrase", "tailor", "customize",
         "job description", "ats", "keywords", "action verbs"
     ]):
         return "resume"
-
-    # Default general mode
     return "general"
 
 
@@ -173,54 +163,22 @@ def get_system_prompt(mode: str) -> str:
 
 def build_prompt(question: str, chunks: list[dict], mode: str) -> str:
     context = "\n\n---\n\n".join(c["text"] for c in chunks)
-
     if mode == "analyzer":
-        return f"""Resume Content:
-{context}
-
-Task: {question}
-
-Analyze this resume thoroughly and provide structured feedback in the exact format specified."""
-
+        return f"Resume Content:\n{context}\n\nTask: {question}\n\nAnalyze thoroughly and provide structured feedback."
     if mode == "cover_letter":
-        return f"""Resume Content:
-{context}
-
-Task: {question}
-
-Write a compelling cover letter based on this resume content."""
-
+        return f"Resume Content:\n{context}\n\nTask: {question}\n\nWrite a compelling cover letter."
     if mode == "skill_gap":
-        return f"""Resume/Documents Content:
-{context}
-
-Task: {question}
-
-Analyze the skill gap and provide structured feedback in the exact format specified."""
-
+        return f"Resume/Documents Content:\n{context}\n\nTask: {question}\n\nAnalyze skill gap with structured feedback."
     if mode == "resume":
-        return f"""Resume/Documents Content:
-{context}
-
-Task: {question}
-
-Optimize and improve based on the content above. Be specific and reference actual content."""
-
-    # General mode
-    return f"""Context:
-{context}
-
-Question: {question}
-
-Answer using only the context above. Cite which source(s) you used."""
+        return f"Resume/Documents Content:\n{context}\n\nTask: {question}\n\nOptimize based on content above."
+    return f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer using only the context above. Cite sources."
 
 
 def calculate_accuracy(distance: float) -> int:
-    """Convert FAISS L2 distance to accuracy percentage."""
     return max(0, min(100, round((1 - distance / 2) * 100)))
 
 
-# ── App setup ─────────────────────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="SmartRAG AI Backend")
 
@@ -230,13 +188,14 @@ app.add_middleware(
     allow_origin_regex=r"https://.*\.lovable\.app|https://.*\.lovableproject\.com",
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "x-session-id"],
+    expose_headers=["x-session-id"],
 )
 
 
 class QuestionRequest(BaseModel):
     question: str
-    mode: Optional[str] = None  # optional override: "resume", "analyzer", "cover_letter", "skill_gap", "general"
+    mode: Optional[str] = None
 
 
 def get_session_dirs(session_id: str):
@@ -261,19 +220,13 @@ def get_files_for_session(session_id: str):
 # ── Session ───────────────────────────────────────────────────────────────────
 
 @app.get("/api/session")
-def create_session(response: Response, session_id: str = Cookie(None)):
-    """Create or return existing session cookie."""
-    if not session_id:
-        session_id = str(uuid.uuid4())
-        response.set_cookie(
-            key="session_id",
-            value=session_id,
-            httponly=True,
-            samesite="none",
-            secure=True,
-            max_age=86400,
-        )
-    return {"session_id": session_id}
+def create_session(x_session_id: Optional[str] = Header(None)):
+    """Return existing session ID or create a new one.
+    Frontend stores this in sessionStorage (tab-isolated).
+    """
+    if not x_session_id:
+        x_session_id = str(uuid.uuid4())
+    return {"session_id": x_session_id}
 
 
 # ── Files ─────────────────────────────────────────────────────────────────────
@@ -284,42 +237,43 @@ def home():
 
 
 @app.get("/api/files")
-def list_files(session_id: str = Cookie(None)):
-    if not session_id:
+def list_files(x_session_id: Optional[str] = Header(None)):
+    if not x_session_id:
         return {"files": []}
-    return {"files": get_files_for_session(session_id)}
+    return {"files": get_files_for_session(x_session_id)}
 
 
 @app.post("/api/upload")
 async def upload_file(
     file: UploadFile = File(...),
-    session_id: str = Cookie(None),
+    x_session_id: Optional[str] = Header(None),
 ):
-    if not session_id:
-        raise HTTPException(status_code=401, detail="No session. Call /api/session first.")
+    if not x_session_id:
+        raise HTTPException(status_code=401, detail="No session ID. Call /api/session first.")
 
-    suffix = Path(file.filename).suffix.lower()
-
-    docs_dir, _ = get_session_dirs(session_id)
+    docs_dir, _ = get_session_dirs(x_session_id)
     destination = docs_dir / file.filename
 
     with open(destination, "wb") as f:
         f.write(await file.read())
 
     subprocess.run(
-        [sys.executable, "ingest.py", "--session", session_id],
+        [sys.executable, "ingest.py", "--session", x_session_id],
         check=True,
     )
 
-    return {"files": get_files_for_session(session_id)}
+    return {"files": get_files_for_session(x_session_id)}
 
 
 @app.delete("/api/files/{filename}")
-def delete_file(filename: str, session_id: str = Cookie(None)):
-    if not session_id:
-        raise HTTPException(status_code=401, detail="No session.")
+def delete_file(
+    filename: str,
+    x_session_id: Optional[str] = Header(None),
+):
+    if not x_session_id:
+        raise HTTPException(status_code=401, detail="No session ID.")
 
-    docs_dir, _ = get_session_dirs(session_id)
+    docs_dir, _ = get_session_dirs(x_session_id)
     file_path = docs_dir / filename
 
     if not file_path.exists():
@@ -327,61 +281,49 @@ def delete_file(filename: str, session_id: str = Cookie(None)):
 
     file_path.unlink()
 
-    remaining = get_files_for_session(session_id)
+    remaining = get_files_for_session(x_session_id)
     if remaining:
         subprocess.run(
-            [sys.executable, "ingest.py", "--session", session_id],
+            [sys.executable, "ingest.py", "--session", x_session_id],
             check=True,
         )
     else:
-        store_dir = Path(f"vector_store/{session_id}")
+        store_dir = Path(f"vector_store/{x_session_id}")
         if store_dir.exists():
             for f in store_dir.iterdir():
                 f.unlink()
 
     return {
         "message": f"{filename} deleted successfully.",
-        "files": get_files_for_session(session_id),
+        "files": get_files_for_session(x_session_id),
     }
 
 
 # ── Ask ───────────────────────────────────────────────────────────────────────
 
 @app.post("/api/ask")
-def ask_question(request: QuestionRequest, session_id: str = Cookie(None)):
-    if not session_id:
-        raise HTTPException(status_code=401, detail="No session.")
+def ask_question(
+    request: QuestionRequest,
+    x_session_id: Optional[str] = Header(None),
+):
+    if not x_session_id:
+        raise HTTPException(status_code=401, detail="No session ID.")
 
-    store_dir = Path(f"vector_store/{session_id}")
+    store_dir = Path(f"vector_store/{x_session_id}")
     if not (store_dir / "index.faiss").exists():
         return {
             "answer": "No documents indexed yet. Please upload a document first.",
-            "sources": [],
-            "chunks": [],
-            "mode": "none",
-            "accuracy": 0,
+            "sources": [], "chunks": [], "mode": "none", "accuracy": 0,
         }
 
-    # Auto-detect mode unless overridden
     mode = request.mode if request.mode else detect_mode(request.question)
-
-    # Use more chunks for analysis tasks
     top_k = 12 if mode in ["analyzer", "skill_gap"] else 8
-    chunks = retrieve(request.question, session_id=session_id, top_k=top_k)
-
-    print(f"\n========== MODE: {mode.upper()} ==========")
-    for i, chunk in enumerate(chunks, 1):
-        print(f"\nChunk {i} | Source: {chunk.get('source')} | Distance: {chunk.get('distance', 'N/A'):.4f}")
-        print(chunk["text"][:300])
-        print("-" * 60)
+    chunks = retrieve(request.question, session_id=x_session_id, top_k=top_k)
 
     if not chunks:
         return {
             "answer": "No relevant content found in your documents.",
-            "sources": [],
-            "chunks": [],
-            "mode": mode,
-            "accuracy": 0,
+            "sources": [], "chunks": [], "mode": mode, "accuracy": 0,
         }
 
     system_prompt = get_system_prompt(mode)
@@ -397,8 +339,6 @@ def ask_question(request: QuestionRequest, session_id: str = Cookie(None)):
     )
 
     answer = response.choices[0].message.content
-
-    # Build enriched sources with accuracy scores
     sources_seen = set()
     enriched_sources = []
     for c in chunks:
@@ -407,7 +347,6 @@ def ask_question(request: QuestionRequest, session_id: str = Cookie(None)):
             sources_seen.add(src)
             enriched_sources.append(src)
 
-    # Calculate per-chunk accuracy and overall confidence
     chunk_accuracies = [calculate_accuracy(c.get("distance", 1.0)) for c in chunks]
     overall_accuracy = round(sum(chunk_accuracies) / len(chunk_accuracies)) if chunk_accuracies else 0
 
@@ -428,26 +367,20 @@ def ask_question(request: QuestionRequest, session_id: str = Cookie(None)):
     }
 
 
-# ── Resume specific endpoints ─────────────────────────────────────────────────
+# ── Resume endpoints ──────────────────────────────────────────────────────────
 
 @app.post("/api/analyze")
-def analyze_resume(session_id: str = Cookie(None)):
-    """Dedicated endpoint to fully analyze the uploaded resume."""
-    if not session_id:
-        raise HTTPException(status_code=401, detail="No session.")
-
-    store_dir = Path(f"vector_store/{session_id}")
+def analyze_resume(x_session_id: Optional[str] = Header(None)):
+    if not x_session_id:
+        raise HTTPException(status_code=401, detail="No session ID.")
+    store_dir = Path(f"vector_store/{x_session_id}")
     if not (store_dir / "index.faiss").exists():
         raise HTTPException(status_code=400, detail="No documents uploaded yet.")
-
     question = "Analyze and score my resume. Provide detailed feedback on all sections."
-    chunks = retrieve(question, session_id=session_id, top_k=15)
-
+    chunks = retrieve(question, session_id=x_session_id, top_k=15)
     if not chunks:
         raise HTTPException(status_code=400, detail="Could not retrieve resume content.")
-
     prompt = build_prompt(question, chunks, "analyzer")
-
     response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
@@ -456,30 +389,23 @@ def analyze_resume(session_id: str = Cookie(None)):
         ],
         temperature=0.2,
     )
-
     chunk_accuracies = [calculate_accuracy(c.get("distance", 1.0)) for c in chunks]
     overall_accuracy = round(sum(chunk_accuracies) / len(chunk_accuracies)) if chunk_accuracies else 0
-
-    return {
-        "analysis": response.choices[0].message.content,
-        "accuracy": overall_accuracy,
-        "chunks_used": len(chunks),
-    }
+    return {"analysis": response.choices[0].message.content, "accuracy": overall_accuracy, "chunks_used": len(chunks)}
 
 
 @app.post("/api/cover-letter")
-def generate_cover_letter(request: QuestionRequest, session_id: str = Cookie(None)):
-    """Generate a cover letter from the uploaded resume."""
-    if not session_id:
-        raise HTTPException(status_code=401, detail="No session.")
-
-    store_dir = Path(f"vector_store/{session_id}")
+def generate_cover_letter(
+    request: QuestionRequest,
+    x_session_id: Optional[str] = Header(None),
+):
+    if not x_session_id:
+        raise HTTPException(status_code=401, detail="No session ID.")
+    store_dir = Path(f"vector_store/{x_session_id}")
     if not (store_dir / "index.faiss").exists():
         raise HTTPException(status_code=400, detail="No documents uploaded yet.")
-
-    chunks = retrieve(request.question, session_id=session_id, top_k=12)
+    chunks = retrieve(request.question, session_id=x_session_id, top_k=12)
     prompt = build_prompt(request.question, chunks, "cover_letter")
-
     response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
@@ -488,26 +414,21 @@ def generate_cover_letter(request: QuestionRequest, session_id: str = Cookie(Non
         ],
         temperature=0.7,
     )
-
-    return {
-        "cover_letter": response.choices[0].message.content,
-        "chunks_used": len(chunks),
-    }
+    return {"cover_letter": response.choices[0].message.content, "chunks_used": len(chunks)}
 
 
 @app.post("/api/skill-gap")
-def analyze_skill_gap(request: QuestionRequest, session_id: str = Cookie(None)):
-    """Analyze skill gap between resume and target role/job description."""
-    if not session_id:
-        raise HTTPException(status_code=401, detail="No session.")
-
-    store_dir = Path(f"vector_store/{session_id}")
+def analyze_skill_gap(
+    request: QuestionRequest,
+    x_session_id: Optional[str] = Header(None),
+):
+    if not x_session_id:
+        raise HTTPException(status_code=401, detail="No session ID.")
+    store_dir = Path(f"vector_store/{x_session_id}")
     if not (store_dir / "index.faiss").exists():
         raise HTTPException(status_code=400, detail="No documents uploaded yet.")
-
-    chunks = retrieve(request.question, session_id=session_id, top_k=12)
+    chunks = retrieve(request.question, session_id=x_session_id, top_k=12)
     prompt = build_prompt(request.question, chunks, "skill_gap")
-
     response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
@@ -516,25 +437,17 @@ def analyze_skill_gap(request: QuestionRequest, session_id: str = Cookie(None)):
         ],
         temperature=0.3,
     )
-
-    return {
-        "skill_gap": response.choices[0].message.content,
-        "chunks_used": len(chunks),
-    }
+    return {"skill_gap": response.choices[0].message.content, "chunks_used": len(chunks)}
 
 
 # ── Dynamic Suggestions ───────────────────────────────────────────────────────
 
 @app.get("/api/suggestions")
-def get_suggestions(session_id: str = Cookie(None)):
-    """Generate dynamic suggested questions based on uploaded files.
-    Reads file names and a small preview of content — never stores or logs it.
-    Returns empty list if no files uploaded.
-    """
-    if not session_id:
+def get_suggestions(x_session_id: Optional[str] = Header(None)):
+    if not x_session_id:
         return {"suggestions": []}
 
-    docs_dir = Path(f"docs/{session_id}")
+    docs_dir = Path(f"docs/{x_session_id}")
     if not docs_dir.exists():
         return {"suggestions": []}
 
@@ -542,9 +455,8 @@ def get_suggestions(session_id: str = Cookie(None)):
     if not files:
         return {"suggestions": []}
 
-    # Read a small preview of each file for context (first 800 chars only)
     file_previews = []
-    for f in files[:3]:  # max 3 files
+    for f in files[:3]:
         ext = f.suffix.lower()
         preview = ""
         try:
@@ -569,30 +481,21 @@ def get_suggestions(session_id: str = Cookie(None)):
                     rows.append(" | ".join(str(c) for c in row if c is not None))
                 preview = "\n".join(rows)[:800]
         except Exception:
-            preview = f.name  # fallback to just filename
+            preview = f.name
 
-        file_previews.append({
-            "name": f.name,
-            "preview": preview.strip()
-        })
+        file_previews.append({"name": f.name, "preview": preview.strip()})
 
-    # Build context for GPT to generate suggestions
     file_context = "\n\n".join([
         f"File: {fp['name']}\nContent preview:\n{fp['preview']}"
         for fp in file_previews
     ])
-
     file_names = [fp["name"] for fp in file_previews]
     num_files = len(file_names)
 
     if num_files == 1:
-        instruction = f"""The user uploaded 1 file: {file_names[0]}
-Generate 3 specific, useful suggested questions a user would ask about this exact document.
-Make them specific to the actual content — not generic like 'summarize this document'."""
+        instruction = f"The user uploaded 1 file: {file_names[0]}\nGenerate 3 specific, useful suggested questions a user would ask about this exact document."
     else:
-        instruction = f"""The user uploaded {num_files} files: {', '.join(file_names)}
-Generate 3 specific suggested questions. Include at least 1 comparison question between the files.
-Make them specific to the actual content — not generic."""
+        instruction = f"The user uploaded {num_files} files: {', '.join(file_names)}\nGenerate 3 specific suggested questions. Include at least 1 comparison question between the files."
 
     prompt = f"""{instruction}
 
@@ -622,7 +525,6 @@ Example format:
             max_tokens=200,
         )
         raw = response.choices[0].message.content.strip()
-        # Strip markdown code fences if present
         raw = re.sub(r"```json|```", "", raw).strip()
         suggestions = json.loads(raw)
         if isinstance(suggestions, list):
@@ -631,7 +533,6 @@ Example format:
             suggestions = []
     except Exception as e:
         print(f"Suggestions generation failed: {e}")
-        # Fallback to generic suggestions based on file count
         if num_files == 1:
             suggestions = [
                 f"Summarize the key points of {file_names[0]}",

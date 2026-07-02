@@ -184,7 +184,10 @@ app = FastAPI(title="SmartRAG AI Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "https://chat-smart.lovable.app",
+    ],
     allow_origin_regex=r"https://.*\.lovable\.app|https://.*\.lovableproject\.com",
     allow_credentials=False,
     allow_methods=["*"],
@@ -218,6 +221,11 @@ def get_files_for_session(session_id: str):
 
 
 # ── Session ───────────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
 
 @app.get("/api/session")
 def create_session(x_session_id: Optional[str] = Header(None)):

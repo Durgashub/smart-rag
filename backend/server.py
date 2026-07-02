@@ -186,7 +186,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
     allow_origin_regex=r"https://.*\.lovable\.app|https://.*\.lovableproject\.com",
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*", "x-session-id"],
     expose_headers=["x-session-id"],

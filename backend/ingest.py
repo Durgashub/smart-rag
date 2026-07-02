@@ -7,14 +7,18 @@ Usage:
 Reads from:  docs/<session_id>/
 Writes to:   vector_store/<session_id>/
 
+Chunking strategy: Parent-Child hierarchy
+- Small child chunks (400 chars) used for precise FAISS retrieval
+- Large parent chunks (1200 chars) stored alongside for GPT context
+- At retrieval time, child chunk finds the match, parent chunk is sent to GPT
+
 Supported file types:
-    .pdf   — pdfplumber + OCR fallback for scanned pages
+    .pdf   — pdfplumber + OCR fallback
     .docx  — python-docx
-    .xlsx  — openpyxl (each sheet → text)
-    .csv   — plain text read
-    .txt   — plain text read
-    .md    — plain text read
-    others — attempt plain text read, skip silently if binary
+    .xlsx  — openpyxl
+    .csv   — csv module
+    .pptx  — python-pptx
+    .txt / .md — plain text
 """
 
 import os
@@ -33,24 +37,27 @@ from pdf2image import convert_from_path
 import pytesseract
 
 load_dotenv()
-
 client = OpenAI()
 
 EMBED_MODEL = "text-embedding-3-small"
-CHUNK_SIZE = 1200
-CHUNK_OVERLAP = 200
+
+# Parent-child chunk sizes
+PARENT_CHUNK_SIZE = 1200   # sent to GPT for answering
+CHILD_CHUNK_SIZE = 400     # used for retrieval (more precise)
+CHILD_OVERLAP = 50         # small overlap between child chunks
+
+CHUNK_OVERLAP = 200        # overlap between parent chunks
 MIN_TEXT_LEN_BEFORE_OCR = 20
+
+SUPPORTED_EXTENSIONS = {
+    ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv",
+    ".txt", ".md", ".pptx"
+}
 
 TESSERACT_CMD = os.getenv("TESSERACT_CMD")
 if TESSERACT_CMD:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 POPPLER_PATH = os.getenv("POPPLER_PATH") or None
-
-# All supported extensions — add more here as needed
-SUPPORTED_EXTENSIONS = {
-    ".pdf", ".docx", ".doc", ".xlsx", ".xls", ".csv",
-    ".txt", ".md", ".pptx"
-}
 
 
 # ── Extractors ────────────────────────────────────────────────────────────────
@@ -72,11 +79,8 @@ def _table_to_markdown(table_rows) -> str:
 
 def _ocr_page(pdf_path: str, page_number: int) -> str:
     images = convert_from_path(
-        pdf_path,
-        first_page=page_number,
-        last_page=page_number,
-        dpi=200,
-        poppler_path=POPPLER_PATH,
+        pdf_path, first_page=page_number, last_page=page_number,
+        dpi=200, poppler_path=POPPLER_PATH,
     )
     if not images:
         return ""
@@ -100,7 +104,7 @@ def load_text_from_pdf(path: str) -> str:
                     if ocr_text.strip():
                         combined = ocr_text.strip()
                 except Exception as e:
-                    print(f"  Warning: OCR failed on page {i} of {Path(path).name}: {e}")
+                    print(f"  Warning: OCR failed on page {i}: {e}")
             if combined:
                 page_texts.append(f"[Page {i}]\n{combined}")
     return "\n\n".join(page_texts)
@@ -114,11 +118,8 @@ def load_text_from_docx(path: str) -> str:
         for para in doc.paragraphs:
             if para.text.strip():
                 parts.append(para.text.strip())
-        # Also extract tables from docx
         for table in doc.tables:
-            rows = []
-            for row in table.rows:
-                rows.append([cell.text.strip() for cell in row.cells])
+            rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
             if rows:
                 parts.append(_table_to_markdown(rows))
         return "\n\n".join(parts)
@@ -143,10 +144,10 @@ def load_text_from_xlsx(path: str) -> str:
                 parts.append(f"[Sheet: {sheet_name}]\n" + _table_to_markdown(rows))
         return "\n\n".join(parts)
     except ImportError:
-        print(f"  Warning: openpyxl not installed. Run: pip install openpyxl")
+        print("  Warning: openpyxl not installed.")
         return ""
     except Exception as e:
-        print(f"  Warning: Could not read xlsx {Path(path).name}: {e}")
+        print(f"  Warning: Could not read xlsx: {e}")
         return ""
 
 
@@ -156,18 +157,19 @@ def load_text_from_pptx(path: str) -> str:
         prs = Presentation(path)
         parts = []
         for i, slide in enumerate(prs.slides, start=1):
-            slide_texts = []
-            for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text.strip():
-                    slide_texts.append(shape.text.strip())
+            slide_texts = [
+                shape.text.strip()
+                for shape in slide.shapes
+                if hasattr(shape, "text") and shape.text.strip()
+            ]
             if slide_texts:
                 parts.append(f"[Slide {i}]\n" + "\n".join(slide_texts))
         return "\n\n".join(parts)
     except ImportError:
-        print(f"  Warning: python-pptx not installed. Run: pip install python-pptx")
+        print("  Warning: python-pptx not installed.")
         return ""
     except Exception as e:
-        print(f"  Warning: Could not read pptx {Path(path).name}: {e}")
+        print(f"  Warning: Could not read pptx: {e}")
         return ""
 
 
@@ -180,43 +182,32 @@ def load_text_from_csv(path: str) -> str:
             for row in reader:
                 if any(cell.strip() for cell in row):
                     rows.append(row)
-        if rows:
-            return _table_to_markdown(rows)
-        return ""
+        return _table_to_markdown(rows) if rows else ""
     except Exception as e:
-        print(f"  Warning: Could not read csv {Path(path).name}: {e}")
+        print(f"  Warning: Could not read csv: {e}")
         return ""
 
 
 def load_text_from_file(path: str) -> str:
     ext = Path(path).suffix.lower()
-
     if ext == ".pdf":
         return load_text_from_pdf(path)
-
     if ext == ".docx":
         return load_text_from_docx(path)
-
     if ext == ".doc":
-        print(f"  Warning: .doc format not supported directly. Convert to .docx for best results.")
+        print(f"  Warning: .doc not supported directly. Convert to .docx.")
         return ""
-
     if ext in {".xlsx", ".xls"}:
         return load_text_from_xlsx(path)
-
     if ext == ".csv":
         return load_text_from_csv(path)
-
     if ext == ".pptx":
         return load_text_from_pptx(path)
-
-    # Plain text fallback for .txt, .md, and anything else
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
-        # Skip if it looks binary (lots of null bytes)
         if content.count("\x00") > 10:
-            print(f"  Warning: {Path(path).name} appears to be binary, skipping.")
+            print(f"  Warning: {Path(path).name} appears binary, skipping.")
             return ""
         return content
     except Exception as e:
@@ -224,7 +215,7 @@ def load_text_from_file(path: str) -> str:
         return ""
 
 
-# ── Chunk quality filter ──────────────────────────────────────────────────────
+# ── Low-value chunk filter ────────────────────────────────────────────────────
 
 def is_low_value_chunk(text: str) -> bool:
     stripped = text.strip()
@@ -242,9 +233,17 @@ def is_low_value_chunk(text: str) -> bool:
     return False
 
 
-# ── Chunking ──────────────────────────────────────────────────────────────────
+# ── Parent-child chunking ─────────────────────────────────────────────────────
 
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP):
+def chunk_into_parents(
+    text: str,
+    chunk_size: int = PARENT_CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP,
+) -> list[str]:
+    """
+    Split text into large parent chunks (paragraph-aware).
+    These are stored for GPT context — bigger = more complete answers.
+    """
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     chunks = []
     current = ""
@@ -260,8 +259,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
             flush()
             start = 0
             while start < len(para):
-                end = start + chunk_size
-                chunks.append(para[start:end].strip())
+                chunks.append(para[start : start + chunk_size].strip())
                 start += chunk_size - overlap
             continue
         if len(current) + len(para) + 2 <= chunk_size:
@@ -272,6 +270,60 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
 
     flush()
     return [c for c in chunks if c]
+
+
+def split_into_children(
+    parent: str,
+    child_size: int = CHILD_CHUNK_SIZE,
+    overlap: int = CHILD_OVERLAP,
+) -> list[str]:
+    """
+    Split a parent chunk into smaller child chunks.
+    These are used for retrieval — smaller = more precise matching.
+    """
+    children = []
+    start = 0
+    while start < len(parent):
+        end = start + child_size
+        children.append(parent[start:end].strip())
+        start += child_size - overlap
+    return [c for c in children if len(c) > 50]  # skip tiny fragments
+
+
+def build_parent_child_chunks(text: str) -> list[dict]:
+    """
+    Build parent-child chunk pairs from document text.
+
+    Returns list of dicts:
+    {
+        "child_text":  "...400 char precise chunk for retrieval...",
+        "parent_text": "...1200 char full chunk sent to GPT...",
+        "parent_id":   0,  # which parent this child belongs to
+    }
+
+    At retrieval time:
+    - FAISS indexes child_text embeddings (precise matching)
+    - GPT receives parent_text (full context for better answers)
+    """
+    parents = chunk_into_parents(text)
+    result = []
+
+    for parent_id, parent in enumerate(parents):
+        if is_low_value_chunk(parent):
+            continue
+
+        children = split_into_children(parent)
+
+        for child in children:
+            if is_low_value_chunk(child):
+                continue
+            result.append({
+                "child_text": child,
+                "parent_text": parent,
+                "parent_id": parent_id,
+            })
+
+    return result
 
 
 # ── Embeddings ────────────────────────────────────────────────────────────────
@@ -292,7 +344,7 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--session", required=True, help="Session ID to scope docs and vector store")
+    parser.add_argument("--session", required=True)
     args = parser.parse_args()
 
     session_id = args.session
@@ -301,7 +353,6 @@ def main():
 
     os.makedirs(store_dir, exist_ok=True)
 
-    # Pick up ALL files — filter by supported extension
     all_files = glob.glob(f"{docs_dir}/**/*.*", recursive=True)
     file_paths = [
         p for p in all_files
@@ -309,13 +360,15 @@ def main():
     ]
 
     if not file_paths:
-        print(f"No supported files found in '{docs_dir}/'. Nothing to index.")
-        print(f"Supported types: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+        print(f"No supported files found in '{docs_dir}/'.")
         return
 
-    all_chunks = []
-    metadata = []
-    skipped_count = 0
+    # metadata now stores both child and parent text
+    all_child_texts = []   # embedded for retrieval
+    metadata = []          # stored alongside index
+    total_parents = 0
+    total_children = 0
+    skipped = 0
 
     for path in file_paths:
         ext = Path(path).suffix.lower()
@@ -326,22 +379,45 @@ def main():
             print(f"  -> No text extracted, skipping.")
             continue
 
-        raw_chunks = chunk_text(text)
-        chunks = [c for c in raw_chunks if not is_low_value_chunk(c)]
-        skipped_count += len(raw_chunks) - len(chunks)
-        print(f"  -> {len(chunks)} chunk(s) kept, {len(raw_chunks) - len(chunks)} skipped")
+        pairs = build_parent_child_chunks(text)
 
-        for chunk in chunks:
-            all_chunks.append(chunk)
-            metadata.append({"source": Path(path).name, "text": chunk})
+        if not pairs:
+            print(f"  -> No chunks produced, skipping.")
+            continue
 
-    if not all_chunks:
-        print("No chunks produced. Check file contents.")
+        # Count unique parents
+        unique_parents = len(set(p["parent_id"] for p in pairs))
+        total_parents += unique_parents
+        total_children += len(pairs)
+        skipped_raw = len(chunk_into_parents(text)) - unique_parents
+        skipped += skipped_raw
+
+        print(
+            f"  -> {unique_parents} parent chunks → "
+            f"{len(pairs)} child chunks "
+            f"({skipped_raw} low-value parents skipped)"
+        )
+
+        for pair in pairs:
+            all_child_texts.append(pair["child_text"])
+            metadata.append({
+                "source": Path(path).name,
+                # text = parent_text: GPT gets full context
+                "text": pair["parent_text"],
+                # child_text stored for debug/display
+                "child_text": pair["child_text"],
+                "parent_id": pair["parent_id"],
+            })
+
+    if not all_child_texts:
+        print("No child chunks produced. Check file contents.")
         return
 
-    print(f"\nTotal: {len(all_chunks)} chunks from {len(file_paths)} file(s) ({skipped_count} skipped).")
-    print("Generating embeddings...")
-    embeddings = embed_texts(all_chunks)
+    print(f"\nTotal: {total_parents} parents → {total_children} children across {len(file_paths)} file(s)")
+    print(f"Embedding {len(all_child_texts)} child chunks (used for retrieval)...")
+
+    # Embed child chunks for precise retrieval
+    embeddings = embed_texts(all_child_texts)
 
     embedding_matrix = np.array(embeddings, dtype="float32")
     dimension = embedding_matrix.shape[1]
@@ -354,6 +430,8 @@ def main():
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     print(f"Done. Index saved to '{store_dir}/'.")
+    print(f"  Child chunks indexed: {len(all_child_texts)}")
+    print(f"  GPT will receive parent chunks ({PARENT_CHUNK_SIZE} chars) for richer answers.")
 
 
 if __name__ == "__main__":

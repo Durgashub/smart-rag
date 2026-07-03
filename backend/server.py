@@ -175,7 +175,18 @@ def build_prompt(question: str, chunks: list[dict], mode: str) -> str:
 
 
 def calculate_accuracy(distance: float) -> int:
-    return max(0, min(100, round((1 - distance / 2) * 100)))
+    """
+    Convert FAISS L2 distance to accuracy percentage.
+    OpenAI text-embedding-3-small typical range: 0.3 (very close) to 1.5 (far)
+    We map this range to 95% down to 40%
+    """
+    # Clamp distance to expected range
+    min_dist = 0.3
+    max_dist = 1.5
+    clamped = max(min_dist, min(max_dist, distance))
+    # Linear interpolation: 0.3 → 95%, 1.5 → 40%
+    accuracy = 95 - ((clamped - min_dist) / (max_dist - min_dist)) * 55
+    return round(accuracy)
 
 
 # ── App ───────────────────────────────────────────────────────────────────────

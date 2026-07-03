@@ -26,6 +26,10 @@ SYSTEM_PROMPT_GENERAL = """
 You are a helpful assistant that answers questions using ONLY the
 provided context. If the answer isn't in the context, say you don't know
 rather than guessing. Always cite which source(s) you used.
+
+Important: For personal information questions (name, contact, identity),
+look carefully at document headers, titles, and the beginning of the content.
+The person's name is usually at the very top of a resume or document.
 """
 
 SYSTEM_PROMPT_RESUME = """
@@ -151,6 +155,15 @@ def detect_mode(question: str) -> str:
     return "general"
 
 
+def get_top_k(question: str, mode: str) -> int:
+    """Use higher top_k for short/vague questions and analysis tasks."""
+    if mode in ["analyzer", "skill_gap"]:
+        return 12
+    if len(question.split()) <= 5:
+        return 12
+    return 8
+
+
 def get_system_prompt(mode: str) -> str:
     return {
         "analyzer": SYSTEM_PROMPT_ANALYZER,
@@ -180,11 +193,9 @@ def calculate_accuracy(distance: float) -> int:
     OpenAI text-embedding-3-small typical range: 0.3 (very close) to 1.5 (far)
     We map this range to 95% down to 40%
     """
-    # Clamp distance to expected range
     min_dist = 0.3
     max_dist = 1.5
     clamped = max(min_dist, min(max_dist, distance))
-    # Linear interpolation: 0.3 → 95%, 1.5 → 40%
     accuracy = 95 - ((clamped - min_dist) / (max_dist - min_dist)) * 55
     return round(accuracy)
 
@@ -240,9 +251,6 @@ def health():
 
 @app.get("/api/session")
 def create_session(x_session_id: Optional[str] = Header(None)):
-    """Return existing session ID or create a new one.
-    Frontend stores this in sessionStorage (tab-isolated).
-    """
     if not x_session_id:
         x_session_id = str(uuid.uuid4())
     return {"session_id": x_session_id}
@@ -336,7 +344,7 @@ def ask_question(
         }
 
     mode = request.mode if request.mode else detect_mode(request.question)
-    top_k = 12 if mode in ["analyzer", "skill_gap"] else 8
+    top_k = get_top_k(request.question, mode)
     chunks = retrieve(request.question, session_id=x_session_id, top_k=top_k)
 
     if not chunks:

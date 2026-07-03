@@ -324,6 +324,22 @@ def retrieve(
     session_id: str,
     top_k: int = DEFAULT_TOP_K,
 ) -> list[dict]:
+    """
+    Full Stage 3 retrieval pipeline:
+
+    1. Rewrite query          → keyword-rich version
+    2. HyDE                   → hypothetical answer embedding
+    3. Multi-query variants   → 3 different angles
+    4. For ALL queries (original + rewritten + HyDE + 3 variants):
+       a. FAISS semantic search
+       b. BM25 keyword search
+       c. RRF fusion
+    5. Merge all results with RRF
+    6. Deduplicate
+    7. Cross-encoder re-ranking
+    8. Source diversification
+    9. Return top_k chunks
+    """
     index, metadata = load_index(session_id)
     corpus = [m["text"] for m in metadata]
 
@@ -335,60 +351,74 @@ def retrieve(
 
     print(f"\n[Retrieval] Question: '{question}'")
 
-    rewritten  = rewrite_query(question)
+    # ── Step 1: Rewrite ──
+    rewritten = rewrite_query(question)
+
+    # ── Step 2: HyDE ──
     hypothesis = generate_hypothetical_answer(question)
-    variants   = generate_query_variants(rewritten)
 
-    all_queries = list(dict.fromkeys([question, rewritten, hypothesis] + variants))
-    print(f"  [Retrieval] {len(all_queries)} total queries")
+    # ── Step 3: Multi-query variants ──
+    variants = generate_query_variants(rewritten)
 
+    # All queries to retrieve for — deduplicated
+    all_queries = list(dict.fromkeys(
+        [question, rewritten, hypothesis] + variants
+    ))
+    print(f"  [Retrieval] {len(all_queries)} total queries (original + rewrite + HyDE + variants)")
+
+    # ── Step 4: Retrieve for each query ──
     all_ranked_lists = []
     semantic_dist_map: dict[int, float] = {}
 
     for q in all_queries:
+        # FAISS
         query_vec = embed_query(q)
         distances, indices = index.search(query_vec, candidate_k)
-        semantic = [(int(idx), float(dist)) for idx, dist in zip(indices[0], distances[0]) if idx != -1]
+        semantic = [
+            (int(idx), float(dist))
+            for idx, dist in zip(indices[0], distances[0])
+            if idx != -1
+        ]
+        # Track best distance per doc
         for doc_id, dist in semantic:
             if doc_id not in semantic_dist_map or dist < semantic_dist_map[doc_id]:
                 semantic_dist_map[doc_id] = dist
+
+        # BM25
         bm25_results = bm25.score(q, top_k=candidate_k)
+
+        # RRF per query
         fused = reciprocal_rank_fusion([semantic, bm25_results])
         all_ranked_lists.append(fused)
 
+    # ── Step 5: Merge all ranked lists ──
     final_ranked = reciprocal_rank_fusion(all_ranked_lists)
 
+    # ── Step 6: Deduplicate and build result dicts ──
     seen_ids: set[int] = set()
     candidates = []
     for doc_id, rrf_score in final_ranked:
         if doc_id in seen_ids or doc_id >= len(metadata):
             continue
         seen_ids.add(doc_id)
-        candidates.append({**metadata[doc_id], "distance": semantic_dist_map.get(doc_id, 1.0), "rrf_score": rrf_score})
+        candidates.append({
+            **metadata[doc_id],
+            "distance": semantic_dist_map.get(doc_id, 1.0),
+            "rrf_score": rrf_score,
+        })
 
-    # Always pin the first chunk of each source document
-    # This ensures header info (name, contact) is always included
-    pinned = []
-    pinned_sources: set[str] = set()
-    for i, m in enumerate(metadata):
-        src = m.get("source", "")
-        if src not in pinned_sources:
-            pinned_sources.add(src)
-            pinned.append({
-                **m,
-                "distance": 0.3,  # treat as high confidence
-                "rrf_score": 999,  # ensure it's always included
-                "pinned": True,
-            })
+    # ── Step 7: Cross-encoder re-ranking ──
+    reranked = rerank_with_cross_encoder(
+        question=question,
+        candidates=candidates,
+        top_k=top_k * 2,
+    )
 
-    # Merge pinned chunks with candidates, avoiding duplicates
-    pinned_texts = {p["text"] for p in pinned}
-    candidates_filtered = [c for c in candidates if c["text"] not in pinned_texts]
-
-    merged = pinned + candidates_filtered
-
-    reranked = rerank_with_cross_encoder(question=question, candidates=merged, top_k=top_k * 2)
+    # ── Step 8: Source diversification ──
     result = _diversify(reranked, top_k)
 
-    print(f"  [Retrieval] Final: {len(result)} chunks from {len(set(c['source'] for c in result))} source(s)")
+    print(
+        f"  [Retrieval] Final: {len(result)} chunks from "
+        f"{len(set(c['source'] for c in result))} source(s)"
+    )
     return result

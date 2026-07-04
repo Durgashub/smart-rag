@@ -156,7 +156,6 @@ def detect_mode(question: str) -> str:
 
 
 def get_top_k(question: str, mode: str) -> int:
-    """Use higher top_k for short/vague questions and analysis tasks."""
     if mode in ["analyzer", "skill_gap"]:
         return 12
     if len(question.split()) <= 5:
@@ -187,12 +186,25 @@ def build_prompt(question: str, chunks: list[dict], mode: str) -> str:
     return f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer using only the context above. Cite sources."
 
 
-def calculate_accuracy(distance: float) -> int:
+def calculate_accuracy(distance: float, cross_encoder_score: float = None) -> int:
     """
-    Convert FAISS L2 distance to accuracy percentage.
-    OpenAI text-embedding-3-small typical range: 0.3 (very close) to 1.5 (far)
-    We map this range to 95% down to 40%
+    Calculate accuracy percentage.
+    Prefers cross-encoder score when available (direct relevance measure).
+    Falls back to FAISS L2 distance if cross-encoder wasn't used.
+
+    Cross-encoder (ms-marco-MiniLM-L-6-v2) scores:
+      Typically range from -10 (irrelevant) to +10 (highly relevant)
+      Relevant chunks usually score between -2 and +8
+
+    FAISS L2 distance fallback:
+      OpenAI text-embedding-3-small typical range: 0.3 (very close) to 1.5 (far)
+      Mapped to 95% down to 40%
     """
+    if cross_encoder_score is not None:
+        # Map -10..+10 → 0..100%
+        normalized = (cross_encoder_score + 10) / 20
+        return round(min(100, max(0, normalized * 100)))
+    # Fallback: FAISS L2 distance
     min_dist = 0.3
     max_dist = 1.5
     clamped = max(min_dist, min(max_dist, distance))
@@ -374,7 +386,14 @@ def ask_question(
             sources_seen.add(src)
             enriched_sources.append(src)
 
-    chunk_accuracies = [calculate_accuracy(c.get("distance", 1.0)) for c in chunks]
+    # ── Use cross-encoder score for accuracy when available ──
+    chunk_accuracies = [
+        calculate_accuracy(
+            c.get("distance", 1.0),
+            c.get("cross_encoder_score"),
+        )
+        for c in chunks
+    ]
     overall_accuracy = round(sum(chunk_accuracies) / len(chunk_accuracies)) if chunk_accuracies else 0
 
     return {
@@ -387,7 +406,10 @@ def ask_question(
                 "source": c.get("source", "Unknown"),
                 "text": c["text"][:300],
                 "distance": c.get("distance"),
-                "accuracy": calculate_accuracy(c.get("distance", 1.0)),
+                "accuracy": calculate_accuracy(
+                    c.get("distance", 1.0),
+                    c.get("cross_encoder_score"),
+                ),
             }
             for c in chunks
         ],
@@ -416,9 +438,19 @@ def analyze_resume(x_session_id: Optional[str] = Header(None)):
         ],
         temperature=0.2,
     )
-    chunk_accuracies = [calculate_accuracy(c.get("distance", 1.0)) for c in chunks]
+    chunk_accuracies = [
+        calculate_accuracy(
+            c.get("distance", 1.0),
+            c.get("cross_encoder_score"),
+        )
+        for c in chunks
+    ]
     overall_accuracy = round(sum(chunk_accuracies) / len(chunk_accuracies)) if chunk_accuracies else 0
-    return {"analysis": response.choices[0].message.content, "accuracy": overall_accuracy, "chunks_used": len(chunks)}
+    return {
+        "analysis": response.choices[0].message.content,
+        "accuracy": overall_accuracy,
+        "chunks_used": len(chunks),
+    }
 
 
 @app.post("/api/cover-letter")

@@ -278,7 +278,7 @@ def rerank_with_cross_encoder(
         return candidates[:top_k]
 
     try:
-        pairs = [(question, c["text"]) for c in rerank_pool]
+        pairs = [(question, c.get("child_text", c["text"])[:400]) for c in rerank_pool]
         scores = cross_encoder.predict(pairs)
         for i, score in enumerate(scores):
             rerank_pool[i]["cross_encoder_score"] = float(score)

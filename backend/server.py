@@ -9,15 +9,13 @@ from typing import Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
-from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Response
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 
 from query import retrieve
 
 load_dotenv()
-
 client = OpenAI()
-
 CHAT_MODEL = "gpt-4.1-mini"
 
 # ── System prompts ────────────────────────────────────────────────────────────
@@ -97,7 +95,6 @@ Format:
 
 Rules:
 - Reference specific achievements and numbers from the resume
-- Match tone to the job description if provided
 - Keep it to 3-4 paragraphs, under 400 words
 - Make it sound human, not templated
 """
@@ -131,26 +128,20 @@ ESTIMATED TIME TO BE COMPETITIVE: [X months]
 
 def detect_mode(question: str) -> str:
     q = question.lower()
-    if any(word in q for word in [
-        "score", "rate my resume", "review my resume", "analyze my resume",
-        "how good is", "rate it", "grade my", "evaluate my resume", "ats score"
-    ]):
+    if any(w in q for w in ["score", "rate my resume", "review my resume",
+        "analyze my resume", "how good is", "rate it", "grade my",
+        "evaluate my resume", "ats score"]):
         return "analyzer"
-    if any(word in q for word in [
-        "cover letter", "write a letter", "application letter", "motivational letter"
-    ]):
+    if any(w in q for w in ["cover letter", "write a letter",
+        "application letter", "motivational letter"]):
         return "cover_letter"
-    if any(word in q for word in [
-        "skill gap", "missing skills", "what skills", "skills i need",
-        "am i qualified", "do i have", "match this job", "fit for this role",
-        "missing for", "lack", "what am i missing"
-    ]):
+    if any(w in q for w in ["skill gap", "missing skills", "what skills",
+        "skills i need", "am i qualified", "do i have", "match this job",
+        "fit for this role", "missing for", "lack", "what am i missing"]):
         return "skill_gap"
-    if any(word in q for word in [
-        "rewrite", "improve", "optimize", "enhance", "update", "fix",
-        "make it better", "stronger", "rephrase", "tailor", "customize",
-        "job description", "ats", "keywords", "action verbs"
-    ]):
+    if any(w in q for w in ["rewrite", "improve", "optimize", "enhance",
+        "update", "fix", "make it better", "stronger", "rephrase", "tailor",
+        "customize", "job description", "ats", "keywords", "action verbs"]):
         return "resume"
     return "general"
 
@@ -165,11 +156,11 @@ def get_top_k(question: str, mode: str) -> int:
 
 def get_system_prompt(mode: str) -> str:
     return {
-        "analyzer": SYSTEM_PROMPT_ANALYZER,
+        "analyzer":     SYSTEM_PROMPT_ANALYZER,
         "cover_letter": SYSTEM_PROMPT_COVER_LETTER,
-        "skill_gap": SYSTEM_PROMPT_SKILL_GAP,
-        "resume": SYSTEM_PROMPT_RESUME,
-        "general": SYSTEM_PROMPT_GENERAL,
+        "skill_gap":    SYSTEM_PROMPT_SKILL_GAP,
+        "resume":       SYSTEM_PROMPT_RESUME,
+        "general":      SYSTEM_PROMPT_GENERAL,
     }.get(mode, SYSTEM_PROMPT_GENERAL)
 
 
@@ -188,28 +179,46 @@ def build_prompt(question: str, chunks: list[dict], mode: str) -> str:
 
 def calculate_accuracy(distance: float, cross_encoder_score: float = None) -> int:
     """
-    Calculate accuracy percentage.
-    Prefers cross-encoder score when available (direct relevance measure).
-    Falls back to FAISS L2 distance if cross-encoder wasn't used.
+    Convert retrieval signals to an accuracy percentage shown in the UI.
 
-    Cross-encoder (ms-marco-MiniLM-L-6-v2) scores:
-      Typically range from -10 (irrelevant) to +10 (highly relevant)
-      Relevant chunks usually score between -2 and +8
+    Strategy:
+    - If cross-encoder score is available AND reasonable (> -5), use it.
+      ms-marco-MiniLM-L-6-v2 on short text: relevant ≈ 0..+10, noise ≈ -10..-5
+      On long parent chunks it often scores -8..-10 even for relevant content,
+      so we only trust it when it's above the noise floor (-5).
+    - Otherwise fall back to FAISS L2 distance, which is reliable regardless
+      of chunk length.
 
-    FAISS L2 distance fallback:
-      OpenAI text-embedding-3-small typical range: 0.3 (very close) to 1.5 (far)
-      Mapped to 95% down to 40%
+    FAISS L2 distance for OpenAI text-embedding-3-small:
+      0.3 → very close match   → ~92%
+      0.6 → good match         → ~82%
+      0.9 → moderate match     → ~70%
+      1.2 → weak match         → ~58%
+      1.5 → distant            → ~46%
     """
-    if cross_encoder_score is not None:
-        # Map -10..+10 → 0..100%
-        normalized = (cross_encoder_score + 10) / 20
-        return round(min(100, max(0, normalized * 100)))
-    # Fallback: FAISS L2 distance
+    CROSS_ENCODER_NOISE_FLOOR = -5.0
+
+    if cross_encoder_score is not None and cross_encoder_score > CROSS_ENCODER_NOISE_FLOOR:
+        # Score range -5..+10 → map to 50%..100%
+        normalized = (cross_encoder_score - CROSS_ENCODER_NOISE_FLOOR) / (10.0 - CROSS_ENCODER_NOISE_FLOOR)
+        return round(min(100, max(50, normalized * 50 + 50)))
+
+    # FAISS L2 distance fallback
     min_dist = 0.3
     max_dist = 1.5
     clamped = max(min_dist, min(max_dist, distance))
-    accuracy = 95 - ((clamped - min_dist) / (max_dist - min_dist)) * 55
+    accuracy = 92 - ((clamped - min_dist) / (max_dist - min_dist)) * 46
     return round(accuracy)
+
+
+def avg_accuracy(chunks: list[dict]) -> int:
+    if not chunks:
+        return 0
+    scores = [
+        calculate_accuracy(c.get("distance", 1.0), c.get("cross_encoder_score"))
+        for c in chunks
+    ]
+    return round(sum(scores) / len(scores))
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -254,7 +263,7 @@ def get_files_for_session(session_id: str):
     ]
 
 
-# ── Session ───────────────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 def health():
@@ -267,8 +276,6 @@ def create_session(x_session_id: Optional[str] = Header(None)):
         x_session_id = str(uuid.uuid4())
     return {"session_id": x_session_id}
 
-
-# ── Files ─────────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def home():
@@ -289,134 +296,83 @@ async def upload_file(
 ):
     if not x_session_id:
         raise HTTPException(status_code=401, detail="No session ID. Call /api/session first.")
-
     docs_dir, _ = get_session_dirs(x_session_id)
     destination = docs_dir / file.filename
-
     with open(destination, "wb") as f:
         f.write(await file.read())
-
-    subprocess.run(
-        [sys.executable, "ingest.py", "--session", x_session_id],
-        check=True,
-    )
-
+    subprocess.run([sys.executable, "ingest.py", "--session", x_session_id], check=True)
     return {"files": get_files_for_session(x_session_id)}
 
 
 @app.delete("/api/files/{filename}")
-def delete_file(
-    filename: str,
-    x_session_id: Optional[str] = Header(None),
-):
+def delete_file(filename: str, x_session_id: Optional[str] = Header(None)):
     if not x_session_id:
         raise HTTPException(status_code=401, detail="No session ID.")
-
     docs_dir, _ = get_session_dirs(x_session_id)
     file_path = docs_dir / filename
-
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found.")
-
     file_path.unlink()
-
     remaining = get_files_for_session(x_session_id)
     if remaining:
-        subprocess.run(
-            [sys.executable, "ingest.py", "--session", x_session_id],
-            check=True,
-        )
+        subprocess.run([sys.executable, "ingest.py", "--session", x_session_id], check=True)
     else:
         store_dir = Path(f"vector_store/{x_session_id}")
         if store_dir.exists():
             for f in store_dir.iterdir():
                 f.unlink()
+    return {"message": f"{filename} deleted successfully.", "files": get_files_for_session(x_session_id)}
 
-    return {
-        "message": f"{filename} deleted successfully.",
-        "files": get_files_for_session(x_session_id),
-    }
-
-
-# ── Ask ───────────────────────────────────────────────────────────────────────
 
 @app.post("/api/ask")
-def ask_question(
-    request: QuestionRequest,
-    x_session_id: Optional[str] = Header(None),
-):
+def ask_question(request: QuestionRequest, x_session_id: Optional[str] = Header(None)):
     if not x_session_id:
         raise HTTPException(status_code=401, detail="No session ID.")
-
     store_dir = Path(f"vector_store/{x_session_id}")
     if not (store_dir / "index.faiss").exists():
-        return {
-            "answer": "No documents indexed yet. Please upload a document first.",
-            "sources": [], "chunks": [], "mode": "none", "accuracy": 0,
-        }
+        return {"answer": "No documents indexed yet. Please upload a document first.",
+                "sources": [], "chunks": [], "mode": "none", "accuracy": 0}
 
-    mode = request.mode if request.mode else detect_mode(request.question)
-    top_k = get_top_k(request.question, mode)
+    mode   = request.mode if request.mode else detect_mode(request.question)
+    top_k  = get_top_k(request.question, mode)
     chunks = retrieve(request.question, session_id=x_session_id, top_k=top_k)
 
     if not chunks:
-        return {
-            "answer": "No relevant content found in your documents.",
-            "sources": [], "chunks": [], "mode": mode, "accuracy": 0,
-        }
-
-    system_prompt = get_system_prompt(mode)
-    prompt = build_prompt(request.question, chunks, mode)
+        return {"answer": "No relevant content found in your documents.",
+                "sources": [], "chunks": [], "mode": mode, "accuracy": 0}
 
     response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": get_system_prompt(mode)},
+            {"role": "user",   "content": build_prompt(request.question, chunks, mode)},
         ],
         temperature=0.3 if mode == "analyzer" else 0.7,
     )
 
-    answer = response.choices[0].message.content
-    sources_seen = set()
-    enriched_sources = []
+    sources_seen, enriched_sources = set(), []
     for c in chunks:
         src = c.get("source", "Unknown")
         if src not in sources_seen:
             sources_seen.add(src)
             enriched_sources.append(src)
 
-    # ── Use cross-encoder score for accuracy when available ──
-    chunk_accuracies = [
-        calculate_accuracy(
-            c.get("distance", 1.0),
-            c.get("cross_encoder_score"),
-        )
-        for c in chunks
-    ]
-    overall_accuracy = round(sum(chunk_accuracies) / len(chunk_accuracies)) if chunk_accuracies else 0
-
     return {
-        "answer": answer,
-        "mode": mode,
-        "sources": enriched_sources,
-        "accuracy": overall_accuracy,
+        "answer":   response.choices[0].message.content,
+        "mode":     mode,
+        "sources":  enriched_sources,
+        "accuracy": avg_accuracy(chunks),
         "chunks": [
             {
-                "source": c.get("source", "Unknown"),
-                "text": c["text"][:300],
+                "source":   c.get("source", "Unknown"),
+                "text":     c["text"][:300],
                 "distance": c.get("distance"),
-                "accuracy": calculate_accuracy(
-                    c.get("distance", 1.0),
-                    c.get("cross_encoder_score"),
-                ),
+                "accuracy": calculate_accuracy(c.get("distance", 1.0), c.get("cross_encoder_score")),
             }
             for c in chunks
         ],
     }
 
-
-# ── Resume endpoints ──────────────────────────────────────────────────────────
 
 @app.post("/api/analyze")
 def analyze_resume(x_session_id: Optional[str] = Header(None)):
@@ -429,47 +385,31 @@ def analyze_resume(x_session_id: Optional[str] = Header(None)):
     chunks = retrieve(question, session_id=x_session_id, top_k=15)
     if not chunks:
         raise HTTPException(status_code=400, detail="Could not retrieve resume content.")
-    prompt = build_prompt(question, chunks, "analyzer")
     response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT_ANALYZER},
-            {"role": "user", "content": prompt},
+            {"role": "user",   "content": build_prompt(question, chunks, "analyzer")},
         ],
         temperature=0.2,
     )
-    chunk_accuracies = [
-        calculate_accuracy(
-            c.get("distance", 1.0),
-            c.get("cross_encoder_score"),
-        )
-        for c in chunks
-    ]
-    overall_accuracy = round(sum(chunk_accuracies) / len(chunk_accuracies)) if chunk_accuracies else 0
-    return {
-        "analysis": response.choices[0].message.content,
-        "accuracy": overall_accuracy,
-        "chunks_used": len(chunks),
-    }
+    return {"analysis": response.choices[0].message.content,
+            "accuracy": avg_accuracy(chunks), "chunks_used": len(chunks)}
 
 
 @app.post("/api/cover-letter")
-def generate_cover_letter(
-    request: QuestionRequest,
-    x_session_id: Optional[str] = Header(None),
-):
+def generate_cover_letter(request: QuestionRequest, x_session_id: Optional[str] = Header(None)):
     if not x_session_id:
         raise HTTPException(status_code=401, detail="No session ID.")
     store_dir = Path(f"vector_store/{x_session_id}")
     if not (store_dir / "index.faiss").exists():
         raise HTTPException(status_code=400, detail="No documents uploaded yet.")
     chunks = retrieve(request.question, session_id=x_session_id, top_k=12)
-    prompt = build_prompt(request.question, chunks, "cover_letter")
     response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT_COVER_LETTER},
-            {"role": "user", "content": prompt},
+            {"role": "user",   "content": build_prompt(request.question, chunks, "cover_letter")},
         ],
         temperature=0.7,
     )
@@ -477,39 +417,31 @@ def generate_cover_letter(
 
 
 @app.post("/api/skill-gap")
-def analyze_skill_gap(
-    request: QuestionRequest,
-    x_session_id: Optional[str] = Header(None),
-):
+def analyze_skill_gap(request: QuestionRequest, x_session_id: Optional[str] = Header(None)):
     if not x_session_id:
         raise HTTPException(status_code=401, detail="No session ID.")
     store_dir = Path(f"vector_store/{x_session_id}")
     if not (store_dir / "index.faiss").exists():
         raise HTTPException(status_code=400, detail="No documents uploaded yet.")
     chunks = retrieve(request.question, session_id=x_session_id, top_k=12)
-    prompt = build_prompt(request.question, chunks, "skill_gap")
     response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT_SKILL_GAP},
-            {"role": "user", "content": prompt},
+            {"role": "user",   "content": build_prompt(request.question, chunks, "skill_gap")},
         ],
         temperature=0.3,
     )
     return {"skill_gap": response.choices[0].message.content, "chunks_used": len(chunks)}
 
 
-# ── Dynamic Suggestions ───────────────────────────────────────────────────────
-
 @app.get("/api/suggestions")
 def get_suggestions(x_session_id: Optional[str] = Header(None)):
     if not x_session_id:
         return {"suggestions": []}
-
     docs_dir = Path(f"docs/{x_session_id}")
     if not docs_dir.exists():
         return {"suggestions": []}
-
     files = [f for f in docs_dir.iterdir() if f.is_file()]
     if not files:
         return {"suggestions": []}
@@ -541,15 +473,14 @@ def get_suggestions(x_session_id: Optional[str] = Header(None)):
                 preview = "\n".join(rows)[:800]
         except Exception:
             preview = f.name
-
         file_previews.append({"name": f.name, "preview": preview.strip()})
 
+    file_names = [fp["name"] for fp in file_previews]
+    num_files  = len(file_names)
     file_context = "\n\n".join([
         f"File: {fp['name']}\nContent preview:\n{fp['preview']}"
         for fp in file_previews
     ])
-    file_names = [fp["name"] for fp in file_previews]
-    num_files = len(file_names)
 
     if num_files == 1:
         instruction = f"The user uploaded 1 file: {file_names[0]}\nGenerate 3 specific, useful suggested questions a user would ask about this exact document."
@@ -578,13 +509,12 @@ Example format:
             model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": "You generate specific, relevant suggested questions based on document content. Return only a JSON array."},
-                {"role": "user", "content": prompt}
+                {"role": "user",   "content": prompt},
             ],
             temperature=0.7,
             max_tokens=200,
         )
-        raw = response.choices[0].message.content.strip()
-        raw = re.sub(r"```json|```", "", raw).strip()
+        raw = re.sub(r"```json|```", "", response.choices[0].message.content.strip()).strip()
         suggestions = json.loads(raw)
         if isinstance(suggestions, list):
             suggestions = [s for s in suggestions if isinstance(s, str)][:3]
@@ -596,13 +526,13 @@ Example format:
             suggestions = [
                 f"Summarize the key points of {file_names[0]}",
                 "What are the main findings in this document?",
-                "What skills or experience does this document highlight?"
+                "What skills or experience does this document highlight?",
             ]
         else:
             suggestions = [
                 f"Compare {file_names[0]} and {file_names[1]}",
                 "What are the key differences between these files?",
-                "Summarize the most important information across all files"
+                "Summarize the most important information across all files",
             ]
 
     return {"suggestions": suggestions}

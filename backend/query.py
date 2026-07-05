@@ -48,7 +48,6 @@ RRF_K = 60
 # Patterns that indicate the question is about personal identity.
 # For these, skip HyDE and query rewriting — literal matching works better.
 IDENTITY_PATTERNS = [
-    # "my X" patterns
     r"\bmy name\b",
     r"\bwho am i\b",
     r"\bmy email\b",
@@ -61,21 +60,6 @@ IDENTITY_PATTERNS = [
     r"\bmy number\b",
     r"\bmy linkedin\b",
     r"\bmy github\b",
-    # "what name / what is the name" patterns
-    r"\bwhat name\b",
-    r"\bwhat.s the name\b",
-    r"\bwhat is the name\b",
-    r"\bthe name of\b",
-    # "who is this" patterns
-    r"\bwho is this\b",
-    r"\bwho does this belong\b",
-    r"\bwhose resume\b",
-    r"\bwhose cv\b",
-    # contact info patterns without "my"
-    r"\bthe email\b",
-    r"\bthe phone\b",
-    r"\bcontact details\b",
-    r"\bcontact info\b",
 ]
 
 def _is_identity_question(question: str) -> bool:
@@ -374,6 +358,123 @@ def rerank_with_cross_encoder(
         return candidates[:top_k]
 
 
+# ── MMR (Maximal Marginal Relevance) ─────────────────────────────────────────
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Cosine similarity between two 1-D numpy vectors."""
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+def mmr_filter(
+    candidates: list[dict],
+    top_k: int,
+    lambda_param: float = 0.7,
+    similarity_threshold: float = 0.85,
+) -> list[dict]:
+    """
+    Maximal Marginal Relevance — remove near-duplicate chunks from the
+    candidate list before cross-encoder re-ranking.
+
+    At each step, MMR keeps the candidate that best balances:
+      - Relevance to the query  (represented by rrf_score)
+      - Diversity from already-selected chunks (cosine similarity on text)
+
+    Formula:
+      MMR score = λ × rrf_score − (1−λ) × max_sim(chunk, selected)
+
+    Parameters:
+      lambda_param        0.0 = pure diversity, 1.0 = pure relevance (no MMR)
+                          0.7 = 70% relevance, 30% diversity penalty (default)
+      similarity_threshold  chunks with cosine sim > this to ANY already-
+                            selected chunk are blocked immediately, regardless
+                            of MMR score — faster and catches near-duplicates
+                            that only differ by a few words (0.85 = very strict)
+
+    Uses child_text for similarity so the same 400-char window the
+    cross-encoder uses is also what MMR compares — keeps behaviour consistent.
+
+    Why here (before cross-encoder, not after):
+      The cross-encoder is expensive. Filtering duplicates first means it only
+      scores distinct, useful chunks — no wasted computation on rephrases.
+    """
+    if len(candidates) <= top_k:
+        return candidates
+
+    # Build simple TF-IDF-style bag-of-words vectors for fast cosine sim.
+    # Using the child_text (short, precise) keeps vectors tight and comparable.
+    # We avoid calling the OpenAI embedding API here to keep latency low.
+    def text_to_vec(text: str) -> np.ndarray:
+        tokens = re.findall(r"\b\w+\b", text.lower())
+        vocab: dict[str, int] = {}
+        for tok in tokens:
+            vocab[tok] = vocab.get(tok, 0) + 1
+        return vocab
+
+    def dict_cosine(a: dict, b: dict) -> float:
+        keys = set(a) | set(b)
+        if not keys:
+            return 0.0
+        dot = sum(a.get(k, 0) * b.get(k, 0) for k in keys)
+        norm_a = math.sqrt(sum(v * v for v in a.values()))
+        norm_b = math.sqrt(sum(v * v for v in b.values()))
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    # Vectorise all candidates once
+    vecs = [text_to_vec(c.get("child_text", c["text"])[:400]) for c in candidates]
+
+    selected_indices: list[int] = []
+    selected_vecs:    list[dict] = []
+
+    # Normalise rrf_scores to [0,1] for the MMR formula
+    max_rrf = max((c.get("rrf_score", 0) for c in candidates), default=1)
+    min_rrf = min((c.get("rrf_score", 0) for c in candidates), default=0)
+    rrf_range = max_rrf - min_rrf or 1.0
+
+    remaining = list(range(len(candidates)))
+
+    while len(selected_indices) < top_k and remaining:
+        best_idx = None
+        best_score = -float("inf")
+
+        for i in remaining:
+            rel = (candidates[i].get("rrf_score", 0) - min_rrf) / rrf_range
+
+            if not selected_vecs:
+                mmr_score = rel
+            else:
+                max_sim = max(dict_cosine(vecs[i], sv) for sv in selected_vecs)
+
+                # Hard block: identical or near-identical chunk
+                if max_sim > similarity_threshold:
+                    continue
+
+                mmr_score = lambda_param * rel - (1 - lambda_param) * max_sim
+
+            if mmr_score > best_score:
+                best_score = mmr_score
+                best_idx = i
+
+        if best_idx is None:
+            break
+
+        selected_indices.append(best_idx)
+        selected_vecs.append(vecs[best_idx])
+        remaining.remove(best_idx)
+
+    result = [candidates[i] for i in selected_indices]
+    removed = len(candidates) - len(result)
+    if removed > 0:
+        print(f"  [MMR] Filtered {removed} near-duplicate chunk(s), kept {len(result)}")
+    else:
+        print(f"  [MMR] No near-duplicates found, all {len(result)} chunks distinct")
+    return result
+
+
 # ── Source diversification ────────────────────────────────────────────────────
 
 def _diversify(candidates: list[dict], top_k: int) -> list[dict]:
@@ -484,14 +585,17 @@ def retrieve(
             "rrf_score": rrf_score,
         })
 
-    # ── Step 7: Cross-encoder re-ranking (on child chunks) ──
+    # ── Step 7: MMR — remove near-duplicate chunks before cross-encoder ──
+    candidates = mmr_filter(candidates, top_k=top_k * 3)
+
+    # ── Step 8: Cross-encoder re-ranking (on child chunks) ──
     reranked = rerank_with_cross_encoder(
         question=question,
         candidates=candidates,
         top_k=top_k * 2,
     )
 
-    # ── Step 8: Source diversification ──
+    # ── Step 9: Source diversification ──
     result = _diversify(reranked, top_k)
 
     print(

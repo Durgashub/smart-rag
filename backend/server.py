@@ -1,3 +1,24 @@
+"""
+SmartRAG AI Backend — Stage 4
+
+What's new vs Stage 3:
+  1. Conversation memory  — history: list[{role, content}] in every /api/ask request
+                            GPT receives full prior turns → follow-up questions work
+  2. LLM intent classification — replaces all regex patterns with one GPT call
+                            Understands any phrasing, returns structured intent
+  3. Map-reduce for cross-doc — each document queried separately, answers merged
+                            Eliminates cross-contamination between documents
+  4. Answer verification  — second GPT call checks answer against retrieved chunks
+                            Catches hallucinations before they reach the user
+
+Memory design:
+  - Frontend keeps the history array in localStorage
+  - Sends last MAX_HISTORY_TURNS turns with every /api/ask request
+  - Backend never stores history — stateless, scales horizontally
+  - Each turn = {role: "user"|"assistant", content: "..."}
+  - Context injected AFTER system prompt, BEFORE current question
+"""
+
 import sys
 import uuid
 import subprocess
@@ -12,109 +33,85 @@ from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 
-from query import retrieve
+from query import retrieve, _is_cross_document_question
 
 load_dotenv()
 client = OpenAI()
-CHAT_MODEL = "gpt-4.1-mini"
+
+CHAT_MODEL       = "gpt-4.1-mini"
+MAX_HISTORY_TURNS = 10   # keep last 10 Q&A pairs (~5k tokens max)
+
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT_GENERAL = """
-You are an AI assistant that answers questions ONLY using the retrieved
-context provided to you.
+You are SmartRAG AI — an intelligent assistant that answers questions ONLY
+using the retrieved document context provided.
 
 Rules:
-1. Use ONLY the information present in the retrieved context.
-2. Never use outside knowledge or make assumptions.
-3. If the answer is not found in the retrieved context, respond:
-   "I don't know based on the provided documents."
-4. Always mention which document(s) or source(s) the information came from.
-5. If multiple documents contain relevant information, combine the answers
-   and clearly indicate which information came from which document.
-6. If documents disagree, report the conflict instead of choosing one.
-7. If a question asks about multiple documents, examine EVERY retrieved
-   document before answering.
-8. Never ignore a retrieved document unless it is completely unrelated.
-9. Quote only short phrases when necessary; otherwise summarize.
+1. Use ONLY the information in the retrieved context. Never use outside knowledge.
+2. If the answer is not in the context: "I don't know based on the provided documents."
+3. Always cite which document(s) your answer comes from.
+4. If documents disagree, report the conflict rather than picking one.
+5. Quote only short phrases; otherwise summarize in your own words.
 
-Special Rules for Personal Information:
-- When asked for a person's name, identity, email, phone, address,
-  company, education, or skills:
-  • Inspect the beginning of every document first.
-  • Check document titles, headers, resume headings, and metadata.
-  • The person's name is usually in the first few lines.
-  • Return one entry per document — never omit a document.
+Conversation awareness:
+- You have access to the conversation history above.
+- Use it to understand follow-up questions ("rewrite that", "make it shorter",
+  "now compare it to the other resume").
+- When a follow-up refers to something said earlier, find it in the history.
+- If a follow-up is ambiguous, ask one clarifying question.
 
-Citation format — always end your answer with:
+Citation format — end every answer with:
 Sources:
-- <document1> (page X if known)
-- <document2> (page X if known)
+- <document_name> (page X if known)
 """
 
 SYSTEM_PROMPT_CROSS_DOC = """
-You are an AI assistant that extracts and lists information from multiple documents.
+You are SmartRAG AI — extracting and comparing information across multiple documents.
 
-CRITICAL RULES:
-1. Read EVERY chunk in the provided context — do not stop after finding one answer.
-2. List one entry per document — NEVER skip or omit a document.
-3. Use ONLY the information in the context — no outside knowledge.
-4. If you find information in a chunk, attribute it to that document.
+RULES:
+1. Each document is clearly separated by === DOCUMENT: filename === markers.
+2. Only use information from within each document's section.
+3. NEVER mix facts between documents.
+4. List one entry per document — never skip a document.
+5. If information is not found in a document, write "Not found in [filename]".
 
-How to find a person's name in a resume chunk:
-- It is the VERY FIRST piece of text at the top, before anything else.
-- It appears before email, phone, location, or any section heading.
-- After a [Page 1] tag, the very next line is usually the person's name.
-- It is typically in ALL CAPS or Title Case, 2-4 words long.
-- Examples of what a name looks like: "DURGA RAO BOJJA", "Venkata Pushpak Praneeth Anala", "SNEHA DEEPIKA VEMANAPALLI"
-- Do NOT confuse section headings (EDUCATION, SKILLS, EXPERIENCE) with names.
+CONVERSATION AWARENESS:
+- Use the conversation history to understand follow-up questions.
+- "Compare them now" refers to the documents being discussed.
+- "Which one is better?" refers to the candidates/documents mentioned earlier.
 
-Step-by-step process:
-1. Count how many document chunks are in the context.
-2. For each chunk, find the name at the very top.
-3. Build your numbered list — one entry per chunk source.
-4. Never stop early — process ALL chunks before writing your answer.
-
-Required output format:
-1. [Full Name] — [source filename]
-   - [any additional requested info]
-2. [Full Name] — [source filename]
-   - [any additional requested info]
-3. [Full Name] — [source filename]
-   - [any additional requested info]
+REQUIRED OUTPUT FORMAT:
+1. [Name/Title] — [filename]
+   - [relevant info]
+2. [Name/Title] — [filename]
+   - [relevant info]
 
 Sources:
 - [Document 1]
 - [Document 2]
-- [Document 3]
-
-If you truly cannot find a name in a chunk after careful inspection, write "Name not found" for that entry — but this should be rare.
 """
 
 SYSTEM_PROMPT_RESUME = """
-You are an expert resume coach, career advisor, and ATS optimization specialist.
-The user has uploaded their resume and possibly a job description.
+You are SmartRAG AI — an expert resume coach and ATS optimization specialist.
 
-Your capabilities:
+Capabilities:
 - Analyze and score resumes (overall + per section out of 10)
-- Rewrite weak sections using strong action verbs and quantified achievements
-- Identify skill gaps between resume and job description
-- Generate tailored cover letters based on resume content
-- Suggest ATS-friendly keywords based on the target role
-- Recommend certifications or skills to add
+- Rewrite sections using strong action verbs and quantified achievements
+- Identify skill gaps vs a job description
+- Generate tailored cover letters
+- Suggest ATS-friendly keywords
 
 Rules:
-- Always be specific — reference actual content from their resume
-- Use STAR format (Situation, Task, Action, Result) for experience rewrites
-- Quantify achievements wherever possible (e.g. "improved performance by 40%")
-- If a job description is provided, optimize specifically for that role
-- If something is not in the context, say so honestly
-- Structure your response clearly with sections and bullet points
+- Reference actual content from the resume — be specific
+- Use STAR format for experience rewrites
+- Quantify achievements wherever possible
+- Use conversation history for follow-ups ("make it shorter", "redo the summary")
 """
 
 SYSTEM_PROMPT_ANALYZER = """
-You are an expert ATS (Applicant Tracking System) resume analyzer.
-Score the resume and provide structured feedback.
+You are SmartRAG AI — an expert ATS resume analyzer.
 
 Always respond in this exact format:
 
@@ -128,179 +125,434 @@ SECTION SCORES:
 - Projects/Certifications: [X/10]
 
 STRENGTHS:
-[List 3-5 specific strengths from the resume]
+[3-5 specific strengths from the resume]
 
 WEAKNESSES:
-[List 3-5 specific areas to improve]
+[3-5 specific areas to improve]
 
-ATS KEYWORDS FOUND: [list keywords]
-ATS KEYWORDS MISSING (suggested): [list suggested keywords for the role]
+ATS KEYWORDS FOUND: [keywords]
+ATS KEYWORDS MISSING: [suggested keywords]
 
 TOP 3 RECOMMENDATIONS:
 1. [Most impactful change]
-2. [Second most impactful change]
-3. [Third most impactful change]
+2. [Second most impactful]
+3. [Third most impactful]
 """
 
 SYSTEM_PROMPT_COVER_LETTER = """
-You are an expert cover letter writer.
-Using the resume context provided, write a compelling, personalized cover letter.
+You are SmartRAG AI — an expert cover letter writer.
 
 Format:
 - Professional header
-- Opening paragraph: Hook + role interest
-- Body paragraph 1: Most relevant experience (from resume)
-- Body paragraph 2: Key achievement + skills match
-- Closing paragraph: Call to action
-- Professional sign-off
+- Opening: Hook + role interest
+- Body 1: Most relevant experience (from resume)
+- Body 2: Key achievement + skills match
+- Closing: Call to action + sign-off
 
 Rules:
 - Reference specific achievements and numbers from the resume
-- Keep it to 3-4 paragraphs, under 400 words
-- Make it sound human, not templated
+- Under 400 words, human tone not templated
+- Use conversation history if user asks to adjust ("shorter", "more formal")
 """
 
 SYSTEM_PROMPT_SKILL_GAP = """
-You are a career development specialist analyzing skill gaps.
-Compare the resume against the job description or target role.
+You are SmartRAG AI — a career development specialist.
 
 Always respond in this exact format:
 
 MATCH SCORE: [X%] - [Brief assessment]
 
-SKILLS YOU HAVE (matching the role):
-[List skills from resume that match]
+SKILLS YOU HAVE (matching):
+[skills from resume that match]
 
 SKILLS YOU'RE MISSING:
-[List required skills not found in resume]
+[required skills not in resume]
 
-NICE-TO-HAVE SKILLS TO ADD:
-[List optional but beneficial skills]
+NICE-TO-HAVE:
+[optional beneficial skills]
 
 ACTION PLAN:
-1. [Most important skill to acquire + how]
+1. [Most important skill + how to get it]
 2. [Second skill + how]
 3. [Third skill + how]
 
 ESTIMATED TIME TO BE COMPETITIVE: [X months]
 """
 
-# ── Mode detection ────────────────────────────────────────────────────────────
 
-def detect_mode(question: str) -> str:
-    q = question.lower()
-    if any(w in q for w in ["score", "rate my resume", "review my resume",
-        "analyze my resume", "how good is", "rate it", "grade my",
-        "evaluate my resume", "ats score"]):
-        return "analyzer"
-    if any(w in q for w in ["cover letter", "write a letter",
-        "application letter", "motivational letter"]):
-        return "cover_letter"
-    if any(w in q for w in ["skill gap", "missing skills", "what skills",
-        "skills i need", "am i qualified", "do i have", "match this job",
-        "fit for this role", "missing for", "lack", "what am i missing"]):
-        return "skill_gap"
-    if any(w in q for w in ["rewrite", "improve", "optimize", "enhance",
-        "update", "fix", "make it better", "stronger", "rephrase", "tailor",
-        "customize", "job description", "ats", "keywords", "action verbs"]):
-        return "resume"
-    return "general"
+# ── Stage 4: LLM Intent Classification ───────────────────────────────────────
+
+class Intent(BaseModel):
+    type: str          # single_doc | cross_doc | identity | resume | analyzer |
+                       # cover_letter | skill_gap | out_of_scope
+    reasoning: str     # why this intent was chosen (for logging)
+    is_followup: bool  # is this a follow-up to a previous answer?
 
 
-def get_top_k(question: str, mode: str) -> int:
-    if mode in ["analyzer", "skill_gap"]:
+def classify_intent(question: str, history: list[dict]) -> Intent:
+    """
+    Replace ALL regex patterns with a single GPT call.
+
+    Returns structured intent that drives:
+    - Which system prompt to use
+    - Whether to use adaptive/map-reduce retrieval
+    - Whether to skip HyDE/rewriting
+    - Whether this is a follow-up (needs history context)
+
+    Fallback: returns single_doc intent if classification fails,
+    so the system always produces an answer.
+    """
+    # Build conversation summary for context
+    recent = history[-4:] if history else []
+    history_summary = ""
+    if recent:
+        lines = []
+        for turn in recent:
+            role = "User" if turn.get("role") == "user" else "Assistant"
+            content = turn.get("content", "")[:200]
+            lines.append(f"{role}: {content}")
+        history_summary = "\nRecent conversation:\n" + "\n".join(lines)
+
+    try:
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an intent classifier for a document Q&A system. "
+                        "Classify the user's question into exactly one of these types:\n\n"
+                        "- single_doc: question about one specific document or person\n"
+                        "- cross_doc: needs info from ALL uploaded documents (list names, compare, summarize all)\n"
+                        "- identity: asking for personal info (name, email, phone, contact)\n"
+                        "- resume: rewrite, optimize, improve, tailor a resume\n"
+                        "- analyzer: score, rate, evaluate, grade a resume\n"
+                        "- cover_letter: write a cover letter or application letter\n"
+                        "- skill_gap: missing skills, qualification match, am I qualified\n"
+                        "- out_of_scope: has nothing to do with the uploaded documents\n\n"
+                        "Also determine if this is a follow-up question referencing a previous answer.\n\n"
+                        "Return ONLY valid JSON, no markdown:\n"
+                        '{"type": "<intent>", "reasoning": "<one sentence why>", "is_followup": <true|false>}'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Question: {question}{history_summary}",
+                },
+            ],
+            temperature=0.1,
+            max_tokens=120,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r"```json|```", "", raw).strip()
+        data = json.loads(raw)
+        intent = Intent(
+            type=data.get("type", "single_doc"),
+            reasoning=data.get("reasoning", ""),
+            is_followup=data.get("is_followup", False),
+        )
+        print(f"  [Intent] {intent.type} | followup={intent.is_followup} | {intent.reasoning}")
+        return intent
+    except Exception as e:
+        print(f"  [Intent] Classification failed: {e} — defaulting to single_doc")
+        return Intent(type="single_doc", reasoning="fallback", is_followup=False)
+
+
+# ── Stage 4: Map-reduce for cross-document questions ─────────────────────────
+
+def map_reduce_answer(
+    question: str,
+    session_id: str,
+    history: list[dict],
+    top_k: int = 8,
+) -> dict:
+    """
+    Map-reduce retrieval and answering for cross-document questions.
+
+    Instead of sending all chunks together (which causes cross-contamination),
+    this function:
+    1. MAP:    For each uploaded document, retrieve chunks from THAT document only
+               and ask GPT to answer from THAT document only
+    2. REDUCE: Ask GPT to merge all per-document answers into a final response
+
+    This makes cross-contamination structurally impossible —
+    each map step is isolated to one document.
+    """
+    docs_dir = Path(f"docs/{session_id}")
+    if not docs_dir.exists():
+        return {"answer": "No documents found.", "sources": [], "chunks": [], "mode": "cross_doc", "accuracy": 0}
+
+    uploaded_files = [f.name for f in docs_dir.iterdir() if f.is_file()]
+    if not uploaded_files:
+        return {"answer": "No documents uploaded.", "sources": [], "chunks": [], "mode": "cross_doc", "accuracy": 0}
+
+    print(f"  [MapReduce] Processing {len(uploaded_files)} document(s)")
+
+    # ── MAP phase: answer per document ────────────────────────────────────────
+    per_doc_answers = []
+    all_chunks = []
+
+    for filename in uploaded_files:
+        # Retrieve chunks scoped to this document only
+        all_retrieved = retrieve(question, session_id=session_id, top_k=top_k)
+        doc_chunks = [c for c in all_retrieved if c.get("source") == filename]
+
+        if not doc_chunks:
+            # Force at least the first chunk from this document
+            all_retrieved_full = retrieve(filename, session_id=session_id, top_k=top_k * 2)
+            doc_chunks = [c for c in all_retrieved_full if c.get("source") == filename][:2]
+
+        if not doc_chunks:
+            per_doc_answers.append({
+                "filename": filename,
+                "answer": f"No relevant content found in {filename}.",
+            })
+            continue
+
+        context = "\n\n".join(c["text"] for c in doc_chunks)
+        all_chunks.extend(doc_chunks)
+
+        map_messages = build_messages_with_history(
+            system_prompt=f"Answer ONLY from this document: {filename}\n\n"
+                          f"Use ONLY the context below. If not found, say 'Not found in {filename}'.",
+            context=context,
+            question=question,
+            history=[],  # no history in map phase — keep each doc answer independent
+        )
+
+        try:
+            map_resp = client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=map_messages,
+                temperature=0.3,
+                max_tokens=800,
+            )
+            doc_answer = map_resp.choices[0].message.content.strip()
+        except Exception as e:
+            doc_answer = f"Error processing {filename}: {e}"
+
+        per_doc_answers.append({"filename": filename, "answer": doc_answer})
+        print(f"  [MapReduce] Mapped {filename} → {len(doc_answer)} chars")
+
+    # ── REDUCE phase: merge all per-document answers ──────────────────────────
+    if len(per_doc_answers) == 1:
+        # Only one document — no need to reduce
+        final_answer = per_doc_answers[0]["answer"]
+    else:
+        reduce_context = "\n\n".join(
+            f"=== {d['filename']} ===\n{d['answer']}"
+            for d in per_doc_answers
+        )
+
+        # Include history in reduce phase so follow-ups work
+        reduce_messages = build_messages_with_history(
+            system_prompt=SYSTEM_PROMPT_CROSS_DOC,
+            context=reduce_context,
+            question=f"Combine the above per-document answers into a final response for: {question}",
+            history=history,
+        )
+
+        try:
+            reduce_resp = client.chat.completions.create(
+                model=CHAT_MODEL,
+                messages=reduce_messages,
+                temperature=0.5,
+                max_tokens=1500,
+            )
+            final_answer = reduce_resp.choices[0].message.content.strip()
+            print(f"  [MapReduce] Reduced → {len(final_answer)} chars")
+        except Exception as e:
+            # Fallback: concatenate map answers
+            final_answer = "\n\n".join(
+                f"**{d['filename']}:**\n{d['answer']}" for d in per_doc_answers
+            )
+
+    # Deduplicate chunks for display
+    seen = set()
+    unique_chunks = []
+    for c in all_chunks:
+        key = (c.get("source"), c.get("text", "")[:100])
+        if key not in seen:
+            seen.add(key)
+            unique_chunks.append(c)
+
+    return {
+        "answer":   final_answer,
+        "mode":     "cross_doc",
+        "sources":  uploaded_files,
+        "accuracy": avg_accuracy(unique_chunks) if unique_chunks else 60,
+        "chunks": [
+            {
+                "source":   c.get("source", "Unknown"),
+                "text":     c["text"][:300],
+                "distance": c.get("distance"),
+                "accuracy": calculate_accuracy(c.get("distance", 1.0), c.get("cross_encoder_score")),
+            }
+            for c in unique_chunks[:8]
+        ],
+    }
+
+
+# ── Stage 4: Answer verification ─────────────────────────────────────────────
+
+def verify_answer(question: str, answer: str, chunks: list[dict]) -> tuple[str, bool]:
+    """
+    Check if the generated answer is actually supported by retrieved chunks.
+
+    Returns (verified_answer, was_modified).
+    If the answer contains unsupported claims, they are flagged or removed.
+
+    Only runs for general and resume modes — not for cross_doc (map-reduce
+    already isolates per-document) or out_of_scope.
+    """
+    context = "\n\n".join(c["text"][:400] for c in chunks[:5])
+
+    try:
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an answer verifier for a RAG system. "
+                        "Check if the answer is fully supported by the context.\n\n"
+                        "If the answer contains claims NOT in the context, "
+                        "remove or correct those claims.\n"
+                        "If the answer is fully supported, return it unchanged.\n"
+                        "Return ONLY the (possibly corrected) answer — no preamble."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Context:\n{context}\n\n"
+                        f"Question: {question}\n\n"
+                        f"Answer to verify:\n{answer}"
+                    ),
+                },
+            ],
+            temperature=0.1,
+            max_tokens=1000,
+        )
+        verified = response.choices[0].message.content.strip()
+        was_modified = verified != answer
+        if was_modified:
+            print(f"  [Verify] Answer modified — unsupported claims removed")
+        else:
+            print(f"  [Verify] Answer verified — fully supported")
+        return verified, was_modified
+    except Exception as e:
+        print(f"  [Verify] Failed: {e} — returning original answer")
+        return answer, False
+
+
+# ── Conversation-aware message builder ───────────────────────────────────────
+
+def build_messages_with_history(
+    system_prompt: str,
+    context: str,
+    question: str,
+    history: list[dict],
+) -> list[dict]:
+    """
+    Build the full messages array for a GPT call with conversation history.
+
+    Structure:
+    [
+      {role: system, content: SYSTEM_PROMPT},
+      {role: user,   content: Q1 + context1},   ← turn 1
+      {role: assistant, content: A1},
+      {role: user,   content: Q2 + context2},   ← turn 2
+      ...
+      {role: user,   content: CURRENT_Q + context}  ← current turn
+    ]
+
+    History turns are included as-is (the context they used is gone,
+    but GPT can still understand references like "that section" or "the first candidate").
+    The CURRENT question always includes fresh retrieved context.
+    """
+    messages = [{"role": "system", "content": system_prompt}]
+
+    # Add history turns (capped at MAX_HISTORY_TURNS)
+    recent_history = history[-(MAX_HISTORY_TURNS * 2):]  # *2 because each turn = user + assistant
+    for turn in recent_history:
+        if turn.get("role") in ("user", "assistant") and turn.get("content"):
+            messages.append({
+                "role": turn["role"],
+                "content": turn["content"],
+            })
+
+    # Add current question with fresh context
+    messages.append({
+        "role": "user",
+        "content": f"Context from your documents:\n{context}\n\nQuestion: {question}",
+    })
+
+    return messages
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def get_top_k(intent_type: str, question: str) -> int:
+    if intent_type in ("analyzer", "skill_gap"):
         return 12
+    if intent_type == "cross_doc":
+        return 8  # per-document in map-reduce
     if len(question.split()) <= 5:
         return 12
     return 8
 
 
-def get_system_prompt(mode: str) -> str:
+def get_system_prompt(intent_type: str) -> str:
     return {
         "analyzer":     SYSTEM_PROMPT_ANALYZER,
         "cover_letter": SYSTEM_PROMPT_COVER_LETTER,
         "skill_gap":    SYSTEM_PROMPT_SKILL_GAP,
         "resume":       SYSTEM_PROMPT_RESUME,
         "cross_doc":    SYSTEM_PROMPT_CROSS_DOC,
+        "identity":     SYSTEM_PROMPT_GENERAL,
+        "single_doc":   SYSTEM_PROMPT_GENERAL,
         "general":      SYSTEM_PROMPT_GENERAL,
-    }.get(mode, SYSTEM_PROMPT_GENERAL)
+        "out_of_scope": SYSTEM_PROMPT_GENERAL,
+    }.get(intent_type, SYSTEM_PROMPT_GENERAL)
 
 
-def build_prompt(question: str, chunks: list[dict], mode: str) -> str:
-    if mode == "cross_doc":
-        # For cross-document questions, label each chunk with its source
-        # so GPT can clearly see which content belongs to which document
-        labeled_chunks = []
-        for c in chunks:
-            source = c.get("source", "Unknown")
-            labeled_chunks.append(f"[Document: {source}]\n{c['text']}")
-        context = "\n\n---\n\n".join(labeled_chunks)
-        return (
-            f"The following chunks are from {len(set(c.get('source','') for c in chunks))} "
-            f"different documents. Process ALL of them.\n\n"
-            f"{context}\n\n"
-            f"Task: {question}\n\n"
-            f"Remember: list one entry for EACH document above."
-        )
+def build_context_prompt(question: str, chunks: list[dict], intent_type: str) -> str:
+    """Build the context string sent to GPT for non-cross-doc questions."""
     context = "\n\n---\n\n".join(c["text"] for c in chunks)
-    if mode == "analyzer":
-        return f"Resume Content:\n{context}\n\nTask: {question}\n\nAnalyze thoroughly and provide structured feedback."
-    if mode == "cover_letter":
+    if intent_type == "analyzer":
+        return f"Resume Content:\n{context}\n\nTask: {question}\n\nAnalyze thoroughly."
+    if intent_type == "cover_letter":
         return f"Resume Content:\n{context}\n\nTask: {question}\n\nWrite a compelling cover letter."
-    if mode == "skill_gap":
-        return f"Resume/Documents Content:\n{context}\n\nTask: {question}\n\nAnalyze skill gap with structured feedback."
-    if mode == "resume":
-        return f"Resume/Documents Content:\n{context}\n\nTask: {question}\n\nOptimize based on content above."
-    return f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer using only the context above. Cite sources."
+    if intent_type == "skill_gap":
+        return f"Documents:\n{context}\n\nTask: {question}\n\nAnalyze skill gap."
+    if intent_type == "resume":
+        return f"Documents:\n{context}\n\nTask: {question}\n\nOptimize based on content."
+    return context  # context is injected via build_messages_with_history
 
 
 def calculate_accuracy(distance: float, cross_encoder_score: float = None) -> int:
-    """
-    Convert retrieval signals to an accuracy percentage shown in the UI.
-
-    Strategy:
-    - If cross-encoder score is available AND reasonable (> -5), use it.
-      ms-marco-MiniLM-L-6-v2 on short text: relevant ≈ 0..+10, noise ≈ -10..-5
-      On long parent chunks it often scores -8..-10 even for relevant content,
-      so we only trust it when it's above the noise floor (-5).
-    - Otherwise fall back to FAISS L2 distance, which is reliable regardless
-      of chunk length.
-
-    FAISS L2 distance for OpenAI text-embedding-3-small:
-      0.3 → very close match   → ~92%
-      0.6 → good match         → ~82%
-      0.9 → moderate match     → ~70%
-      1.2 → weak match         → ~58%
-      1.5 → distant            → ~46%
-    """
     CROSS_ENCODER_NOISE_FLOOR = -5.0
-
     if cross_encoder_score is not None and cross_encoder_score > CROSS_ENCODER_NOISE_FLOOR:
-        # Score range -5..+10 → map to 50%..100%
         normalized = (cross_encoder_score - CROSS_ENCODER_NOISE_FLOOR) / (10.0 - CROSS_ENCODER_NOISE_FLOOR)
         return round(min(100, max(50, normalized * 50 + 50)))
-
-    # FAISS L2 distance fallback
-    min_dist = 0.3
-    max_dist = 1.5
+    min_dist, max_dist = 0.3, 1.5
     clamped = max(min_dist, min(max_dist, distance))
-    accuracy = 92 - ((clamped - min_dist) / (max_dist - min_dist)) * 46
-    return round(accuracy)
+    return round(92 - ((clamped - min_dist) / (max_dist - min_dist)) * 46)
 
 
 def avg_accuracy(chunks: list[dict]) -> int:
     if not chunks:
         return 0
-    scores = [
+    return max(
         calculate_accuracy(c.get("distance", 1.0), c.get("cross_encoder_score"))
         for c in chunks
-    ]
-    return max(scores)
+    )
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="SmartRAG AI Backend")
+app = FastAPI(title="SmartRAG AI — Stage 4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -316,13 +568,21 @@ app.add_middleware(
 )
 
 
+# ── Request models ────────────────────────────────────────────────────────────
+
+class HistoryTurn(BaseModel):
+    role: str       # "user" or "assistant"
+    content: str
+
+
 class QuestionRequest(BaseModel):
     question: str
     mode: Optional[str] = None
+    history: list[HistoryTurn] = []  # ← NEW: conversation history
 
 
 def get_session_dirs(session_id: str):
-    docs_dir = Path(f"docs/{session_id}")
+    docs_dir  = Path(f"docs/{session_id}")
     store_dir = Path(f"vector_store/{session_id}")
     docs_dir.mkdir(parents=True, exist_ok=True)
     store_dir.mkdir(parents=True, exist_ok=True)
@@ -344,7 +604,7 @@ def get_files_for_session(session_id: str):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "stage": 4}
 
 
 @app.get("/api/session")
@@ -356,7 +616,7 @@ def create_session(x_session_id: Optional[str] = Header(None)):
 
 @app.get("/")
 def home():
-    return {"message": "SmartRAG AI Backend Running"}
+    return {"message": "SmartRAG AI Backend — Stage 4"}
 
 
 @app.get("/api/files")
@@ -372,7 +632,7 @@ async def upload_file(
     x_session_id: Optional[str] = Header(None),
 ):
     if not x_session_id:
-        raise HTTPException(status_code=401, detail="No session ID. Call /api/session first.")
+        raise HTTPException(status_code=401, detail="No session ID.")
     docs_dir, _ = get_session_dirs(x_session_id)
     destination = docs_dir / file.filename
     with open(destination, "wb") as f:
@@ -398,39 +658,95 @@ def delete_file(filename: str, x_session_id: Optional[str] = Header(None)):
         if store_dir.exists():
             for f in store_dir.iterdir():
                 f.unlink()
-    return {"message": f"{filename} deleted successfully.", "files": get_files_for_session(x_session_id)}
+    return {"message": f"{filename} deleted.", "files": get_files_for_session(x_session_id)}
 
 
 @app.post("/api/ask")
-def ask_question(request: QuestionRequest, x_session_id: Optional[str] = Header(None)):
+def ask_question(
+    request: QuestionRequest,
+    x_session_id: Optional[str] = Header(None),
+):
+    """
+    Main chat endpoint — Stage 4 pipeline:
+
+    1. Classify intent (GPT call)
+    2. If cross_doc → map-reduce (one GPT call per document, then merge)
+    3. If out_of_scope → refuse without retrieval
+    4. Otherwise → retrieve → build messages with history → GPT answer
+    5. Verify answer (GPT call) for single_doc/identity
+    6. Return answer + sources + accuracy + intent metadata
+    """
     if not x_session_id:
         raise HTTPException(status_code=401, detail="No session ID.")
+
     store_dir = Path(f"vector_store/{x_session_id}")
     if not (store_dir / "index.faiss").exists():
-        return {"answer": "No documents indexed yet. Please upload a document first.",
-                "sources": [], "chunks": [], "mode": "none", "accuracy": 0}
+        return {
+            "answer":   "No documents indexed yet. Please upload a document first.",
+            "sources":  [], "chunks": [], "mode": "none", "accuracy": 0,
+        }
 
-    mode   = request.mode if request.mode else detect_mode(request.question)
-    top_k  = get_top_k(request.question, mode)
+    # Convert history pydantic models to plain dicts
+    history = [{"role": t.role, "content": t.content} for t in request.history]
+
+    # ── Step 1: Classify intent ──────────────────────────────────────────────
+    intent = classify_intent(request.question, history)
+
+    # Allow frontend to override intent (e.g. explicit mode button)
+    if request.mode and request.mode != "auto":
+        intent.type = request.mode
+        print(f"  [Intent] Overridden by frontend: {intent.type}")
+
+    # ── Step 2: Handle out_of_scope ─────────────────────────────────────────
+    if intent.type == "out_of_scope":
+        return {
+            "answer":   "I can only answer questions about your uploaded documents. "
+                        "That question appears to be outside the scope of your documents.",
+            "sources":  [], "chunks": [], "mode": "out_of_scope", "accuracy": 0,
+        }
+
+    # ── Step 3: Cross-doc → map-reduce ──────────────────────────────────────
+    if intent.type == "cross_doc":
+        return map_reduce_answer(
+            question=request.question,
+            session_id=x_session_id,
+            history=history,
+            top_k=get_top_k(intent.type, request.question),
+        )
+
+    # ── Step 4: Standard retrieval + history-aware GPT call ─────────────────
+    top_k  = get_top_k(intent.type, request.question)
     chunks = retrieve(request.question, session_id=x_session_id, top_k=top_k)
 
     if not chunks:
-        return {"answer": "No relevant content found in your documents.",
-                "sources": [], "chunks": [], "mode": mode, "accuracy": 0}
+        return {
+            "answer":   "No relevant content found in your documents.",
+            "sources":  [], "chunks": [], "mode": intent.type, "accuracy": 0,
+        }
 
-    # Use cross-doc prompt when the question spans multiple documents
-    from query import _is_cross_document_question
-    effective_mode = "cross_doc" if _is_cross_document_question(request.question) and mode == "general" else mode
+    system_prompt   = get_system_prompt(intent.type)
+    context_content = build_context_prompt(request.question, chunks, intent.type)
+
+    messages = build_messages_with_history(
+        system_prompt=system_prompt,
+        context=context_content,
+        question=request.question,
+        history=history,
+    )
 
     response = client.chat.completions.create(
         model=CHAT_MODEL,
-        messages=[
-            {"role": "system", "content": get_system_prompt(effective_mode)},
-            {"role": "user",   "content": build_prompt(request.question, chunks, effective_mode)},
-        ],
-        temperature=0.3 if effective_mode == "analyzer" else 0.7,
+        messages=messages,
+        temperature=0.3 if intent.type in ("analyzer", "skill_gap") else 0.7,
+        max_tokens=1500,
     )
+    answer = response.choices[0].message.content.strip()
 
+    # ── Step 5: Verify answer (single_doc and identity only) ─────────────────
+    if intent.type in ("single_doc", "identity", "general"):
+        answer, _ = verify_answer(request.question, answer, chunks)
+
+    # ── Step 6: Build response ───────────────────────────────────────────────
     sources_seen, enriched_sources = set(), []
     for c in chunks:
         src = c.get("source", "Unknown")
@@ -439,10 +755,11 @@ def ask_question(request: QuestionRequest, x_session_id: Optional[str] = Header(
             enriched_sources.append(src)
 
     return {
-        "answer":   response.choices[0].message.content,
-        "mode":     effective_mode,
-        "sources":  enriched_sources,
-        "accuracy": avg_accuracy(chunks),
+        "answer":    answer,
+        "mode":      intent.type,
+        "is_followup": intent.is_followup,
+        "sources":   enriched_sources,
+        "accuracy":  avg_accuracy(chunks),
         "chunks": [
             {
                 "source":   c.get("source", "Unknown"),
@@ -455,6 +772,8 @@ def ask_question(request: QuestionRequest, x_session_id: Optional[str] = Header(
     }
 
 
+# ── Dedicated endpoints (kept for backward compatibility) ────────────────────
+
 @app.post("/api/analyze")
 def analyze_resume(x_session_id: Optional[str] = Header(None)):
     if not x_session_id:
@@ -466,16 +785,14 @@ def analyze_resume(x_session_id: Optional[str] = Header(None)):
     chunks = retrieve(question, session_id=x_session_id, top_k=15)
     if not chunks:
         raise HTTPException(status_code=400, detail="Could not retrieve resume content.")
-    response = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT_ANALYZER},
-            {"role": "user",   "content": build_prompt(question, chunks, "analyzer")},
-        ],
-        temperature=0.2,
+    messages = build_messages_with_history(
+        system_prompt=SYSTEM_PROMPT_ANALYZER,
+        context="\n\n".join(c["text"] for c in chunks),
+        question=question,
+        history=[],
     )
-    return {"analysis": response.choices[0].message.content,
-            "accuracy": avg_accuracy(chunks), "chunks_used": len(chunks)}
+    response = client.chat.completions.create(model=CHAT_MODEL, messages=messages, temperature=0.2)
+    return {"analysis": response.choices[0].message.content, "accuracy": avg_accuracy(chunks), "chunks_used": len(chunks)}
 
 
 @app.post("/api/cover-letter")
@@ -486,14 +803,14 @@ def generate_cover_letter(request: QuestionRequest, x_session_id: Optional[str] 
     if not (store_dir / "index.faiss").exists():
         raise HTTPException(status_code=400, detail="No documents uploaded yet.")
     chunks = retrieve(request.question, session_id=x_session_id, top_k=12)
-    response = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT_COVER_LETTER},
-            {"role": "user",   "content": build_prompt(request.question, chunks, "cover_letter")},
-        ],
-        temperature=0.7,
+    history = [{"role": t.role, "content": t.content} for t in request.history]
+    messages = build_messages_with_history(
+        system_prompt=SYSTEM_PROMPT_COVER_LETTER,
+        context="\n\n".join(c["text"] for c in chunks),
+        question=request.question,
+        history=history,
     )
+    response = client.chat.completions.create(model=CHAT_MODEL, messages=messages, temperature=0.7)
     return {"cover_letter": response.choices[0].message.content, "chunks_used": len(chunks)}
 
 
@@ -505,14 +822,14 @@ def analyze_skill_gap(request: QuestionRequest, x_session_id: Optional[str] = He
     if not (store_dir / "index.faiss").exists():
         raise HTTPException(status_code=400, detail="No documents uploaded yet.")
     chunks = retrieve(request.question, session_id=x_session_id, top_k=12)
-    response = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT_SKILL_GAP},
-            {"role": "user",   "content": build_prompt(request.question, chunks, "skill_gap")},
-        ],
-        temperature=0.3,
+    history = [{"role": t.role, "content": t.content} for t in request.history]
+    messages = build_messages_with_history(
+        system_prompt=SYSTEM_PROMPT_SKILL_GAP,
+        context="\n\n".join(c["text"] for c in chunks),
+        question=request.question,
+        history=history,
     )
+    response = client.chat.completions.create(model=CHAT_MODEL, messages=messages, temperature=0.3)
     return {"skill_gap": response.choices[0].message.content, "chunks_used": len(chunks)}
 
 
@@ -544,53 +861,25 @@ def get_suggestions(x_session_id: Optional[str] = Header(None)):
             elif ext in {".txt", ".md", ".csv"}:
                 with open(f, "r", encoding="utf-8", errors="ignore") as fh:
                     preview = fh.read()[:800]
-            elif ext in {".xlsx", ".xls"}:
-                import openpyxl
-                wb = openpyxl.load_workbook(str(f), data_only=True)
-                ws = wb.active
-                rows = []
-                for row in ws.iter_rows(values_only=True, max_row=10):
-                    rows.append(" | ".join(str(c) for c in row if c is not None))
-                preview = "\n".join(rows)[:800]
         except Exception:
             preview = f.name
         file_previews.append({"name": f.name, "preview": preview.strip()})
 
     file_names = [fp["name"] for fp in file_previews]
     num_files  = len(file_names)
-    file_context = "\n\n".join([
-        f"File: {fp['name']}\nContent preview:\n{fp['preview']}"
-        for fp in file_previews
-    ])
+    file_context = "\n\n".join([f"File: {fp['name']}\nPreview:\n{fp['preview']}" for fp in file_previews])
 
     if num_files == 1:
-        instruction = f"The user uploaded 1 file: {file_names[0]}\nGenerate 3 specific, useful suggested questions a user would ask about this exact document."
+        instruction = f"Generate 3 specific questions for: {file_names[0]}"
     else:
-        instruction = f"The user uploaded {num_files} files: {', '.join(file_names)}\nGenerate 3 specific suggested questions. Include at least 1 comparison question between the files."
-
-    prompt = f"""{instruction}
-
-File content previews:
-{file_context}
-
-Rules:
-- Return ONLY a JSON array of exactly 3 question strings
-- No preamble, no explanation, no markdown — just the raw JSON array
-- Questions must be specific to the actual content shown
-- Keep each question under 12 words
-- If files look like resumes: suggest resume-specific questions
-- If files look like data/reports: suggest analysis questions
-- If mixed file types: suggest comparison and analysis questions
-
-Example format:
-["Question 1?", "Question 2?", "Question 3?"]"""
+        instruction = f"Generate 3 questions for {num_files} files: {', '.join(file_names)}. Include 1 comparison question."
 
     try:
         response = client.chat.completions.create(
             model=CHAT_MODEL,
             messages=[
-                {"role": "system", "content": "You generate specific, relevant suggested questions based on document content. Return only a JSON array."},
-                {"role": "user",   "content": prompt},
+                {"role": "system", "content": "Generate specific suggested questions. Return ONLY a JSON array of 3 strings."},
+                {"role": "user",   "content": f"{instruction}\n\n{file_context}\n\nReturn: [\"Q1?\", \"Q2?\", \"Q3?\"]"},
             ],
             temperature=0.7,
             max_tokens=200,
@@ -601,19 +890,11 @@ Example format:
             suggestions = [s for s in suggestions if isinstance(s, str)][:3]
         else:
             suggestions = []
-    except Exception as e:
-        print(f"Suggestions generation failed: {e}")
-        if num_files == 1:
-            suggestions = [
-                f"Summarize the key points of {file_names[0]}",
-                "What are the main findings in this document?",
-                "What skills or experience does this document highlight?",
-            ]
-        else:
-            suggestions = [
-                f"Compare {file_names[0]} and {file_names[1]}",
-                "What are the key differences between these files?",
-                "Summarize the most important information across all files",
-            ]
+    except Exception:
+        suggestions = [
+            f"Summarize {file_names[0]}",
+            "What are the main skills mentioned?",
+            "Compare the candidates" if num_files > 1 else "What is the work experience?",
+        ]
 
     return {"suggestions": suggestions}

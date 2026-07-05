@@ -3,21 +3,28 @@ Retrieval helpers — session-scoped hybrid search with full Stage 3 pipeline.
 
 Pipeline:
 1. Query rewriting      — rephrase question to be more search-friendly
+                          (skipped for identity questions to preserve specificity)
 2. HyDE                 — generate hypothetical answer, embed that instead
+                          (skipped for identity questions to prevent hallucination)
 3. Multi-query          — generate 3 variants, retrieve for each
 4. BM25 keyword search  — exact match, names, dates, numbers
 5. FAISS semantic search — conceptual similarity
 6. RRF fusion           — merge all ranked lists into one
-7. Cross-encoder        — re-rank top candidates by reading question+chunk together
+7. Cross-encoder        — re-rank using child chunks (400 chars, model's sweet spot)
 8. Source diversity     — cap chunks per source
 9. Deduplication        — remove duplicate chunks across multi-query results
 
-Why HyDE works:
-  A vague question like "tell me about leadership" has a weak embedding
-  because it lacks specific vocabulary. A hypothetical answer like
-  "Leadership involves setting vision, motivating teams, making decisions..."
-  has a MUCH richer embedding that matches actual document content better.
-  We embed both the question AND the hypothetical answer and retrieve for both.
+Why HyDE is skipped for identity questions:
+  "What is my name?" → HyDE hallucinates "Your name is Alex J..." → wrong
+  embedding → retrieves irrelevant chunks → cross-encoder scores -10.
+  For identity questions, the original literal question + BM25 exact match
+  is far more reliable.
+
+Why child chunks are used for cross-encoder:
+  ms-marco-MiniLM-L-6-v2 was trained on short passages (~100-300 chars).
+  Sending 1200-char parent chunks produces extreme negative scores even
+  for genuinely relevant content. Child chunks (400 chars) stay within
+  the model's trained range and produce reliable positive scores.
 """
 
 import json
@@ -34,13 +41,35 @@ load_dotenv()
 client = OpenAI()
 
 EMBED_MODEL = "text-embedding-3-small"
-CHAT_MODEL = "gpt-4.1-mini"
+CHAT_MODEL  = "gpt-4.1-mini"
 DEFAULT_TOP_K = 6
 RRF_K = 60
 
-# Cross-encoder — loaded once and cached
-_cross_encoder = None
+# Patterns that indicate the question is about personal identity.
+# For these, skip HyDE and query rewriting — literal matching works better.
+IDENTITY_PATTERNS = [
+    r"\bmy name\b",
+    r"\bwho am i\b",
+    r"\bmy email\b",
+    r"\bmy phone\b",
+    r"\bmy address\b",
+    r"\bmy contact\b",
+    r"\bmy age\b",
+    r"\bmy dob\b",
+    r"\bmy birthday\b",
+    r"\bmy number\b",
+    r"\bmy linkedin\b",
+    r"\bmy github\b",
+]
 
+def _is_identity_question(question: str) -> bool:
+    q = question.lower()
+    return any(re.search(p, q) for p in IDENTITY_PATTERNS)
+
+
+# ── Cross-encoder — loaded once and cached ────────────────────────────────────
+
+_cross_encoder = None
 
 def get_cross_encoder():
     global _cross_encoder
@@ -51,10 +80,10 @@ def get_cross_encoder():
             _cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
             print("[CrossEncoder] Ready")
         except ImportError:
-            print("[CrossEncoder] sentence-transformers not installed — skipping re-ranking")
+            print("[CrossEncoder] sentence-transformers not installed — skipping")
             _cross_encoder = "unavailable"
         except Exception as e:
-            print(f"[CrossEncoder] Failed to load: {e} — skipping re-ranking")
+            print(f"[CrossEncoder] Failed to load: {e} — skipping")
             _cross_encoder = "unavailable"
     return _cross_encoder if _cross_encoder != "unavailable" else None
 
@@ -80,9 +109,16 @@ def embed_query(question: str) -> np.ndarray:
 
 def rewrite_query(question: str) -> str:
     """
-    Rewrite the user's question to be more search-friendly.
-    Returns original if rewriting fails.
+    Rewrite the question to be keyword-rich for document search.
+
+    Skipped for identity questions — rewriting "what is my name?" into
+    "methods to identify personal name, techniques for name recognition..."
+    is generic and loses the specificity needed for BM25 exact matching.
     """
+    if _is_identity_question(question):
+        print(f"  [Rewrite] Skipped — identity question, keeping literal")
+        return question
+
     try:
         response = client.chat.completions.create(
             model=CHAT_MODEL,
@@ -124,16 +160,21 @@ def generate_hypothetical_answer(question: str) -> str:
     Then embed THAT — it has much richer vocabulary matching actual content.
 
     Example:
-      Question:  "tell me about leadership"
+      Question:   "tell me about leadership"
       Hypothesis: "Leadership is the ability to guide and motivate teams toward
                    a shared goal. Effective leaders demonstrate vision, emotional
                    intelligence, strategic thinking, and communication skills..."
 
-    The hypothesis embedding matches document chunks far better than the
-    question embedding alone.
-
-    Returns original question if generation fails (safe fallback).
+    Skipped for identity questions — GPT hallucinates wrong names/details
+    which poisons retrieval:
+      Question:   "what is my name?"
+      Hypothesis: "Your registered name is Alex Johnson..." (WRONG)
+      → wrong embedding → irrelevant chunks → cross-encoder scores -10
     """
+    if _is_identity_question(question):
+        print(f"  [HyDE] Skipped — identity question (hallucination risk)")
+        return question
+
     try:
         response = client.chat.completions.create(
             model=CHAT_MODEL,
@@ -201,7 +242,7 @@ def generate_query_variants(question: str) -> list[str]:
     return [question]
 
 
-# ── BM25 ──────────────────────────────────────────────────────────────────────
+# ── BM25 ─────────────────────────────────────────────────────────────────────
 
 def tokenize(text: str) -> list[str]:
     return re.findall(r"\b\w+\b", text.lower())
@@ -215,7 +256,7 @@ class BM25:
         self.tokenized = [tokenize(doc) for doc in corpus]
         self.avgdl = sum(len(d) for d in self.tokenized) / max(self.corpus_size, 1)
         self.idf: dict[str, float] = {}
-        self.tf: list[dict[str, int]] = []
+        self.tf:  list[dict[str, int]] = []
         df: dict[str, int] = defaultdict(int)
         for doc_tokens in self.tokenized:
             term_counts: dict[str, int] = defaultdict(int)
@@ -241,7 +282,7 @@ class BM25:
                 if tf == 0:
                     continue
                 dl = len(self.tokenized[doc_id])
-                numerator = tf * (self.k1 + 1)
+                numerator   = tf * (self.k1 + 1)
                 denominator = tf + self.k1 * (1 - self.b + self.b * dl / self.avgdl)
                 scores[doc_id] += idf * numerator / denominator
         return sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
@@ -267,18 +308,31 @@ def rerank_with_cross_encoder(
     candidates: list[dict],
     top_k: int,
 ) -> list[dict]:
-    """Re-rank candidates by reading question+chunk together."""
+    """
+    Re-rank candidates by reading question + chunk together.
+
+    Uses child_text (400 chars) instead of parent text (1200 chars).
+    ms-marco-MiniLM-L-6-v2 was trained on short passages — sending long
+    parent chunks produces extreme negative scores (-10) even for relevant
+    content, making the model useless. Child chunks stay within the model's
+    trained range and produce reliable positive relevance scores.
+    """
     cross_encoder = get_cross_encoder()
     if cross_encoder is None:
         print("  [CrossEncoder] Unavailable — using RRF order")
         return candidates[:top_k]
 
-    rerank_pool = candidates[: top_k * 2]
+    rerank_pool = candidates[:top_k * 2]
     if not rerank_pool:
         return candidates[:top_k]
 
     try:
-        pairs = [(question, c.get("child_text", c["text"])[:400]) for c in rerank_pool]
+        # Use child_text for scoring (short, precise, within model's range)
+        # Fall back to truncated parent text if child_text not stored
+        pairs = [
+            (question, c.get("child_text", c["text"])[:400])
+            for c in rerank_pool
+        ]
         scores = cross_encoder.predict(pairs)
         for i, score in enumerate(scores):
             rerank_pool[i]["cross_encoder_score"] = float(score)
@@ -300,7 +354,7 @@ def rerank_with_cross_encoder(
 # ── Source diversification ────────────────────────────────────────────────────
 
 def _diversify(candidates: list[dict], top_k: int) -> list[dict]:
-    selected = []
+    selected: list[dict] = []
     per_source_count: dict[str, int] = {}
     max_per_source = max(2, top_k // 2)
     for c in candidates:
@@ -313,7 +367,7 @@ def _diversify(candidates: list[dict], top_k: int) -> list[dict]:
         per_source_count[src] = per_source_count.get(src, 0) + 1
     if len(selected) < top_k:
         remaining = [c for c in candidates if c not in selected]
-        selected.extend(remaining[: top_k - len(selected)])
+        selected.extend(remaining[:top_k - len(selected)])
     return selected
 
 
@@ -327,18 +381,18 @@ def retrieve(
     """
     Full Stage 3 retrieval pipeline:
 
-    1. Rewrite query          → keyword-rich version
-    2. HyDE                   → hypothetical answer embedding
+    1. Rewrite query          → keyword-rich version (skipped for identity Qs)
+    2. HyDE                   → hypothetical answer embedding (skipped for identity Qs)
     3. Multi-query variants   → 3 different angles
     4. For ALL queries (original + rewritten + HyDE + 3 variants):
        a. FAISS semantic search
        b. BM25 keyword search
-       c. RRF fusion
-    5. Merge all results with RRF
+       c. RRF fusion per query
+    5. Merge all per-query ranked lists with RRF
     6. Deduplicate
-    7. Cross-encoder re-ranking
+    7. Cross-encoder re-ranking on child chunks (400 chars)
     8. Source diversification
-    9. Return top_k chunks
+    9. Return top_k chunks (GPT receives parent text for full context)
     """
     index, metadata = load_index(session_id)
     corpus = [m["text"] for m in metadata]
@@ -360,18 +414,19 @@ def retrieve(
     # ── Step 3: Multi-query variants ──
     variants = generate_query_variants(rewritten)
 
-    # All queries to retrieve for — deduplicated
+    # Deduplicate queries — hypothesis == question when HyDE is skipped,
+    # so dict.fromkeys naturally deduplicates it
     all_queries = list(dict.fromkeys(
         [question, rewritten, hypothesis] + variants
     ))
-    print(f"  [Retrieval] {len(all_queries)} total queries (original + rewrite + HyDE + variants)")
+    print(f"  [Retrieval] {len(all_queries)} total queries")
 
     # ── Step 4: Retrieve for each query ──
-    all_ranked_lists = []
+    all_ranked_lists: list[list[tuple[int, float]]] = []
     semantic_dist_map: dict[int, float] = {}
 
     for q in all_queries:
-        # FAISS
+        # FAISS semantic search
         query_vec = embed_query(q)
         distances, indices = index.search(query_vec, candidate_k)
         semantic = [
@@ -379,12 +434,11 @@ def retrieve(
             for idx, dist in zip(indices[0], distances[0])
             if idx != -1
         ]
-        # Track best distance per doc
         for doc_id, dist in semantic:
             if doc_id not in semantic_dist_map or dist < semantic_dist_map[doc_id]:
                 semantic_dist_map[doc_id] = dist
 
-        # BM25
+        # BM25 keyword search
         bm25_results = bm25.score(q, top_k=candidate_k)
 
         # RRF per query
@@ -394,9 +448,9 @@ def retrieve(
     # ── Step 5: Merge all ranked lists ──
     final_ranked = reciprocal_rank_fusion(all_ranked_lists)
 
-    # ── Step 6: Deduplicate and build result dicts ──
+    # ── Step 6: Deduplicate and build candidate dicts ──
     seen_ids: set[int] = set()
-    candidates = []
+    candidates: list[dict] = []
     for doc_id, rrf_score in final_ranked:
         if doc_id in seen_ids or doc_id >= len(metadata):
             continue
@@ -407,7 +461,7 @@ def retrieve(
             "rrf_score": rrf_score,
         })
 
-    # ── Step 7: Cross-encoder re-ranking ──
+    # ── Step 7: Cross-encoder re-ranking (on child chunks) ──
     reranked = rerank_with_cross_encoder(
         question=question,
         candidates=candidates,

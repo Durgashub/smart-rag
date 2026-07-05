@@ -48,6 +48,7 @@ RRF_K = 60
 # Patterns that indicate the question is about personal identity.
 # For these, skip HyDE and query rewriting — literal matching works better.
 IDENTITY_PATTERNS = [
+    # "my X" patterns
     r"\bmy name\b",
     r"\bwho am i\b",
     r"\bmy email\b",
@@ -60,11 +61,62 @@ IDENTITY_PATTERNS = [
     r"\bmy number\b",
     r"\bmy linkedin\b",
     r"\bmy github\b",
+    # "what name / what is the name" patterns
+    r"\bwhat name\b",
+    r"\bwhat.s the name\b",
+    r"\bwhat is the name\b",
+    r"\bthe name of\b",
+    # "who is this" patterns
+    r"\bwho is this\b",
+    r"\bwho does this belong\b",
+    r"\bwhose resume\b",
+    r"\bwhose cv\b",
+    # contact info patterns without "my"
+    r"\bthe email\b",
+    r"\bthe phone\b",
+    r"\bcontact details\b",
+    r"\bcontact info\b",
+    # aggregation/listing — skip HyDE to avoid hallucinated names
+    r"\blist.*names?\b",
+    r"\bwhat.*names?\b",
+    r"\bnames?.*in.*doc",
+    r"\bwho.*uploaded\b",
+    r"\blist.*people\b",
+    r"\ball.*names?\b",
+    r"\bnames?.*resume\b",
+    r"\bresume.*names?\b",
+    r"\bpeople.*in.*doc",
 ]
 
 def _is_identity_question(question: str) -> bool:
     q = question.lower()
     return any(re.search(p, q) for p in IDENTITY_PATTERNS)
+
+
+# ── Intent classification ─────────────────────────────────────────────────────
+
+CROSS_DOC_PATTERNS = [
+    r"all.*(resume|document|file|pdf|candidate|person|people)",
+    r"(resume|document|file|pdf|candidate|person|people).*all",
+    r"compare",
+    r"list.*all",
+    r"all.*names?",
+    r"every.*(resume|document|candidate)",
+    r"each.*(resume|document|candidate)",
+    r"summariz.*all",
+    r"across.*document",
+    r"which.*document",
+    r"which.*file",
+    r"list.*names?",
+    r"names.*from.*all",
+    r"names.*and.*skills?",
+    r"skills.*of.*all",
+]
+
+def _is_cross_document_question(question: str) -> bool:
+    """Detect questions that need content from EVERY uploaded document."""
+    q = question.lower()
+    return any(re.search(p, q) for p in CROSS_DOC_PATTERNS)
 
 
 # ── Cross-encoder — loaded once and cached ────────────────────────────────────
@@ -495,6 +547,54 @@ def _diversify(candidates: list[dict], top_k: int) -> list[dict]:
     return selected
 
 
+# ── Adaptive retrieval for cross-document questions ──────────────────────────
+
+def _force_one_chunk_per_source(
+    candidates: list[dict],
+    metadata: list[dict],
+    top_k: int,
+) -> list[dict]:
+    """
+    For cross-document questions (e.g. "list all names", "compare resumes"),
+    guarantee at least one chunk from EVERY document in the index.
+
+    Strategy:
+    1. Collect all unique source documents present in the full metadata.
+    2. For each source, find its highest-ranked candidate chunk.
+    3. Reserve one slot per source, fill remaining slots with best candidates.
+
+    This directly solves the "Durga missing from name list" problem —
+    even if Durga's chunks rank lower, they still get a guaranteed slot.
+    """
+    all_sources = list(dict.fromkeys(m["source"] for m in metadata))
+    num_sources = len(all_sources)
+
+    if num_sources <= 1:
+        return candidates[:top_k]
+
+    # Build a map: source → best candidate chunk (by position in ranked list)
+    best_per_source: dict[str, dict] = {}
+    for c in candidates:
+        src = c["source"]
+        if src not in best_per_source:
+            best_per_source[src] = c
+
+    # Slots: 1 guaranteed per source, rest filled by best overall
+    guaranteed = [best_per_source[src] for src in all_sources if src in best_per_source]
+    guaranteed_ids = {id(c) for c in guaranteed}
+
+    # Fill remaining slots with best candidates not already guaranteed
+    remaining_slots = max(0, top_k - len(guaranteed))
+    fillers = [c for c in candidates if id(c) not in guaranteed_ids][:remaining_slots]
+
+    result = guaranteed + fillers
+    print(
+        f"  [Adaptive] Cross-doc mode: guaranteed 1 chunk from each of "
+        f"{len(guaranteed)}/{num_sources} source(s)"
+    )
+    return result
+
+
 # ── Main retrieval ────────────────────────────────────────────────────────────
 
 def retrieve(
@@ -524,7 +624,18 @@ def retrieve(
     if not corpus:
         return []
 
-    candidate_k = min(top_k * 4, len(metadata))
+    # ── Intent classification ──
+    is_cross_doc = _is_cross_document_question(question)
+    is_identity  = _is_identity_question(question)
+    if is_cross_doc:
+        print(f"  [Intent] Cross-document question detected")
+    elif is_identity:
+        print(f"  [Intent] Identity question detected")
+    else:
+        print(f"  [Intent] Single-document question")
+
+    # For cross-doc questions expand the candidate pool significantly
+    candidate_k = min(top_k * 6 if is_cross_doc else top_k * 4, len(metadata))
     bm25 = BM25(corpus)
 
     print(f"\n[Retrieval] Question: '{question}'")
@@ -595,8 +706,13 @@ def retrieve(
         top_k=top_k * 2,
     )
 
-    # ── Step 9: Source diversification ──
-    result = _diversify(reranked, top_k)
+    # ── Step 9: Source diversification + adaptive retrieval ──
+    if is_cross_doc:
+        # Cross-document questions: guarantee one chunk per source FIRST,
+        # then apply standard source diversification on top
+        result = _force_one_chunk_per_source(reranked, metadata, top_k)
+    else:
+        result = _diversify(reranked, top_k)
 
     print(
         f"  [Retrieval] Final: {len(result)} chunks from "

@@ -317,6 +317,13 @@ def rerank_with_cross_encoder(
     content, making the model useless. Child chunks stay within the model's
     trained range and produce reliable positive relevance scores.
     """
+    # Skip cross-encoder for identity questions — ms-marco scores name
+    # lookup questions near -10 regardless of chunk quality, producing
+    # misleading low accuracy. BM25 + RRF already rank the name chunk #1.
+    if _is_identity_question(question):
+        print("  [CrossEncoder] Skipped — identity question, using RRF order")
+        return candidates[:top_k]
+
     cross_encoder = get_cross_encoder()
     if cross_encoder is None:
         print("  [CrossEncoder] Unavailable — using RRF order")

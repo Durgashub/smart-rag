@@ -212,13 +212,16 @@ def calculate_accuracy(distance: float, cross_encoder_score: float = None) -> in
 
 
 def avg_accuracy(chunks: list[dict]) -> int:
+    """Use the best chunk's accuracy as overall confidence.
+    The top-ranked chunk is what answers the question — averaging
+    all chunks penalises good answers with irrelevant supporting context."""
     if not chunks:
         return 0
     scores = [
         calculate_accuracy(c.get("distance", 1.0), c.get("cross_encoder_score"))
         for c in chunks
     ]
-    return round(sum(scores) / len(scores))
+    return max(scores)
 
 
 # ── App ───────────────────────────────────────────────────────────────────────

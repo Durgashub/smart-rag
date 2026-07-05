@@ -48,6 +48,7 @@ RRF_K = 60
 # Patterns that indicate the question is about personal identity.
 # For these, skip HyDE and query rewriting — literal matching works better.
 IDENTITY_PATTERNS = [
+    # "my X" patterns
     r"\bmy name\b",
     r"\bwho am i\b",
     r"\bmy email\b",
@@ -60,6 +61,21 @@ IDENTITY_PATTERNS = [
     r"\bmy number\b",
     r"\bmy linkedin\b",
     r"\bmy github\b",
+    # "what name / what is the name" patterns
+    r"\bwhat name\b",
+    r"\bwhat.s the name\b",
+    r"\bwhat is the name\b",
+    r"\bthe name of\b",
+    # "who is this" patterns
+    r"\bwho is this\b",
+    r"\bwho does this belong\b",
+    r"\bwhose resume\b",
+    r"\bwhose cv\b",
+    # contact info patterns without "my"
+    r"\bthe email\b",
+    r"\bthe phone\b",
+    r"\bcontact details\b",
+    r"\bcontact info\b",
 ]
 
 def _is_identity_question(question: str) -> bool:

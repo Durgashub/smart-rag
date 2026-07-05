@@ -76,15 +76,9 @@ IDENTITY_PATTERNS = [
     r"\bthe phone\b",
     r"\bcontact details\b",
     r"\bcontact info\b",
-    # aggregation/listing — skip HyDE to avoid hallucinated names
-    r"\blist.*names?\b",
-    r"\bwhat.*names?\b",
-    r"\bnames?.*in.*doc",
+    # aggregation/listing — these stay as identity to skip HyDE
+    # but CROSS_DOC_PATTERNS also catches them for adaptive retrieval + cross-doc prompt
     r"\bwho.*uploaded\b",
-    r"\blist.*people\b",
-    r"\ball.*names?\b",
-    r"\bnames?.*resume\b",
-    r"\bresume.*names?\b",
     r"\bpeople.*in.*doc",
 ]
 
@@ -96,21 +90,27 @@ def _is_identity_question(question: str) -> bool:
 # ── Intent classification ─────────────────────────────────────────────────────
 
 CROSS_DOC_PATTERNS = [
-    r"all.*(resume|document|file|pdf|candidate|person|people)",
-    r"(resume|document|file|pdf|candidate|person|people).*all",
-    r"compare",
-    r"list.*all",
-    r"all.*names?",
-    r"every.*(resume|document|candidate)",
-    r"each.*(resume|document|candidate)",
-    r"summariz.*all",
-    r"across.*document",
-    r"which.*document",
-    r"which.*file",
-    r"list.*names?",
-    r"names.*from.*all",
-    r"names.*and.*skills?",
-    r"skills.*of.*all",
+    r"\ball\b.*\b(resume|document|file|pdf|candidate|person|people)\b",
+    r"\b(resume|document|file|pdf|candidate|person|people)\b.*\ball\b",
+    r"\bcompare\b",
+    r"\blist.*all\b",
+    r"\ball.*names?\b",
+    r"\bevery\b.*\b(resume|document|candidate)\b",
+    r"\beach\b.*\b(resume|document|candidate)\b",
+    r"\bsummariz.*all\b",
+    r"\bacross.*document",
+    r"\bwhich.*document",
+    r"\bwhich.*file",
+    r"\blist.*names?\b",
+    r"\blist.*the.*names?\b",
+    r"\bwhat.*names?\b",
+    r"\bnames?.*resume\b",
+    r"\bresume.*names?\b",
+    r"\bnames.*from.*all\b",
+    r"\bnames?.*and.*skills?\b",
+    r"\blist.*names?.*skills?",
+    r"\bskills.*of.*all\b",
+    r"\blist.*people\b",
 ]
 
 def _is_cross_document_question(question: str) -> bool:
@@ -627,9 +627,12 @@ def retrieve(
     # ── Intent classification ──
     is_cross_doc = _is_cross_document_question(question)
     is_identity  = _is_identity_question(question)
-    if is_cross_doc:
+    # Cross-doc wins UNLESS it's also a pure identity question (e.g. "what is my name?")
+    # Pure identity questions (my name/email/phone) should stay identity path
+    if is_cross_doc and not is_identity:
         print(f"  [Intent] Cross-document question detected")
     elif is_identity:
+        is_cross_doc = False  # force identity path
         print(f"  [Intent] Identity question detected")
     else:
         print(f"  [Intent] Single-document question")

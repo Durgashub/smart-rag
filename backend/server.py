@@ -52,6 +52,45 @@ Sources:
 - <document2> (page X if known)
 """
 
+SYSTEM_PROMPT_CROSS_DOC = """
+You are an AI assistant that extracts and lists information from multiple documents.
+
+CRITICAL RULES:
+1. Read EVERY chunk in the provided context — do not stop after finding one answer.
+2. List one entry per document — NEVER skip or omit a document.
+3. Use ONLY the information in the context — no outside knowledge.
+4. If you find information in a chunk, attribute it to that document.
+
+How to find a person's name in a resume chunk:
+- It is the VERY FIRST piece of text at the top, before anything else.
+- It appears before email, phone, location, or any section heading.
+- After a [Page 1] tag, the very next line is usually the person's name.
+- It is typically in ALL CAPS or Title Case, 2-4 words long.
+- Examples of what a name looks like: "DURGA RAO BOJJA", "Venkata Pushpak Praneeth Anala", "SNEHA DEEPIKA VEMANAPALLI"
+- Do NOT confuse section headings (EDUCATION, SKILLS, EXPERIENCE) with names.
+
+Step-by-step process:
+1. Count how many document chunks are in the context.
+2. For each chunk, find the name at the very top.
+3. Build your numbered list — one entry per chunk source.
+4. Never stop early — process ALL chunks before writing your answer.
+
+Required output format:
+1. [Full Name] — [source filename]
+   - [any additional requested info]
+2. [Full Name] — [source filename]
+   - [any additional requested info]
+3. [Full Name] — [source filename]
+   - [any additional requested info]
+
+Sources:
+- [Document 1]
+- [Document 2]
+- [Document 3]
+
+If you truly cannot find a name in a chunk after careful inspection, write "Name not found" for that entry — but this should be rare.
+"""
+
 SYSTEM_PROMPT_RESUME = """
 You are an expert resume coach, career advisor, and ATS optimization specialist.
 The user has uploaded their resume and possibly a job description.
@@ -182,11 +221,27 @@ def get_system_prompt(mode: str) -> str:
         "cover_letter": SYSTEM_PROMPT_COVER_LETTER,
         "skill_gap":    SYSTEM_PROMPT_SKILL_GAP,
         "resume":       SYSTEM_PROMPT_RESUME,
+        "cross_doc":    SYSTEM_PROMPT_CROSS_DOC,
         "general":      SYSTEM_PROMPT_GENERAL,
     }.get(mode, SYSTEM_PROMPT_GENERAL)
 
 
 def build_prompt(question: str, chunks: list[dict], mode: str) -> str:
+    if mode == "cross_doc":
+        # For cross-document questions, label each chunk with its source
+        # so GPT can clearly see which content belongs to which document
+        labeled_chunks = []
+        for c in chunks:
+            source = c.get("source", "Unknown")
+            labeled_chunks.append(f"[Document: {source}]\n{c['text']}")
+        context = "\n\n---\n\n".join(labeled_chunks)
+        return (
+            f"The following chunks are from {len(set(c.get('source','') for c in chunks))} "
+            f"different documents. Process ALL of them.\n\n"
+            f"{context}\n\n"
+            f"Task: {question}\n\n"
+            f"Remember: list one entry for EACH document above."
+        )
     context = "\n\n---\n\n".join(c["text"] for c in chunks)
     if mode == "analyzer":
         return f"Resume Content:\n{context}\n\nTask: {question}\n\nAnalyze thoroughly and provide structured feedback."
@@ -363,13 +418,17 @@ def ask_question(request: QuestionRequest, x_session_id: Optional[str] = Header(
         return {"answer": "No relevant content found in your documents.",
                 "sources": [], "chunks": [], "mode": mode, "accuracy": 0}
 
+    # Use cross-doc prompt when the question spans multiple documents
+    from query import _is_cross_document_question
+    effective_mode = "cross_doc" if _is_cross_document_question(request.question) and mode == "general" else mode
+
     response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
-            {"role": "system", "content": get_system_prompt(mode)},
-            {"role": "user",   "content": build_prompt(request.question, chunks, mode)},
+            {"role": "system", "content": get_system_prompt(effective_mode)},
+            {"role": "user",   "content": build_prompt(request.question, chunks, effective_mode)},
         ],
-        temperature=0.3 if mode == "analyzer" else 0.7,
+        temperature=0.3 if effective_mode == "analyzer" else 0.7,
     )
 
     sources_seen, enriched_sources = set(), []
@@ -381,7 +440,7 @@ def ask_question(request: QuestionRequest, x_session_id: Optional[str] = Header(
 
     return {
         "answer":   response.choices[0].message.content,
-        "mode":     mode,
+        "mode":     effective_mode,
         "sources":  enriched_sources,
         "accuracy": avg_accuracy(chunks),
         "chunks": [

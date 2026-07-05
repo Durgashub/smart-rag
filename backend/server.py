@@ -223,14 +223,24 @@ def classify_intent(question: str, history: list[dict]) -> Intent:
                         "You are an intent classifier for a document Q&A system. "
                         "Classify the user's question into exactly one of these types:\n\n"
                         "- single_doc: question about one specific document or person\n"
-                        "- cross_doc: needs info from ALL uploaded documents (list names, compare, summarize all)\n"
-                        "- identity: asking for personal info (name, email, phone, contact)\n"
+                        "- cross_doc: needs info from ALL uploaded documents "
+                        "(list names, compare all, who are the candidates, summarize all, "
+                        "which candidate, compare resumes, list all)\n"
+                        "- identity: asking for personal info about ONE person "
+                        "(my name, my email, my phone, my contact)\n"
                         "- resume: rewrite, optimize, improve, tailor a resume\n"
                         "- analyzer: score, rate, evaluate, grade a resume\n"
                         "- cover_letter: write a cover letter or application letter\n"
                         "- skill_gap: missing skills, qualification match, am I qualified\n"
-                        "- out_of_scope: has nothing to do with the uploaded documents\n\n"
-                        "Also determine if this is a follow-up question referencing a previous answer.\n\n"
+                        "- out_of_scope: completely unrelated to documents "
+                        "(weather, news, general knowledge)\n\n"
+                        "IMPORTANT: 'who are the candidates', 'list all names', "
+                        "'compare the resumes', 'which candidate should I hire' "
+                        "are ALL cross_doc — not single_doc or identity.\n\n"
+                        "is_followup: true ONLY if the question uses pronouns like "
+                        "'it', 'that', 'them', 'the previous', 'same one' referring "
+                        "to a specific prior answer. Questions about ALL documents "
+                        "are NOT follow-ups even if asked after another question.\n\n"
                         "Return ONLY valid JSON, no markdown:\n"
                         '{"type": "<intent>", "reasoning": "<one sentence why>", "is_followup": <true|false>}'
                     ),
@@ -260,6 +270,93 @@ def classify_intent(question: str, history: list[dict]) -> Intent:
 
 # ── Stage 4: Map-reduce for cross-document questions ─────────────────────────
 
+def simple_retrieve(question: str, session_id: str, top_k: int = 20) -> list[dict]:
+    """
+    Simple direct retrieval — bypasses ALL Stage 3 enhancements.
+    No rewriting, no HyDE, no multi-query, no MMR, no cross-encoder.
+    Just: embed question → FAISS search → return chunks.
+    Used by map-reduce map phase to avoid HyDE hallucinating names.
+    """
+    import json as _json
+    import numpy as np
+    import faiss as _faiss
+
+    store_dir = f"vector_store/{session_id}"
+    try:
+        index = _faiss.read_index(f"{store_dir}/index.faiss")
+        with open(f"{store_dir}/metadata.json", "r", encoding="utf-8") as mf:
+            metadata = _json.load(mf)
+    except Exception as e:
+        print(f"    [SimpleRetrieve] Failed to load index: {e}")
+        return []
+
+    response = client.embeddings.create(model="text-embedding-3-small", input=[question])
+    query_vec = np.array([response.data[0].embedding], dtype="float32")
+
+    k = min(top_k, len(metadata))
+    distances, indices = index.search(query_vec, k)
+
+    results = []
+    for idx, dist in zip(indices[0], distances[0]):
+        if idx == -1 or idx >= len(metadata):
+            continue
+        results.append({**metadata[idx], "distance": float(dist)})
+    return results
+
+
+def get_doc_chunks(session_id: str, filename: str, question: str, top_k: int) -> list[dict]:
+    """
+    Retrieve chunks belonging to ONE specific document.
+
+    Three-level strategy to guarantee content from every document
+    regardless of how vague the question is:
+
+    Level 1 — Question-based retrieval:
+      Run the actual question against the full index, take only chunks
+      from this document. Works well for specific questions.
+
+    Level 2 — Name-based retrieval:
+      Search using the person's name (extracted from filename). This
+      reliably finds the header/name chunk even for vague questions,
+      because the name appears in every section of their resume.
+
+    Level 3 — Metadata scan (guaranteed fallback):
+      Read metadata.json directly and return the first N chunks from
+      this document. Always succeeds as long as the doc was ingested.
+    """
+    import json as _json
+
+    # Level 1: question-based (simple retrieval — no HyDE/rewrite/MMR)
+    pool = simple_retrieve(question, session_id=session_id, top_k=top_k * 6)
+    chunks = [c for c in pool if c.get("source") == filename]
+    if chunks:
+        print(f"    [Map] {filename} → {len(chunks)} chunks (L1 question-based)")
+        return chunks[:top_k]
+
+    # Level 2: name-based (filename without extension, underscores → spaces)
+    name_query = re.sub(r'[_\.\-]', ' ', filename.rsplit('.', 1)[0]).strip()
+    pool2 = simple_retrieve(name_query, session_id=session_id, top_k=top_k * 4)
+    chunks2 = [c for c in pool2 if c.get("source") == filename]
+    if chunks2:
+        print(f"    [Map] {filename} → {len(chunks2)} chunks (L2 name-based)")
+        return chunks2[:top_k]
+
+    # Level 3: direct metadata scan — always works
+    try:
+        store_dir = f"vector_store/{session_id}"
+        with open(f"{store_dir}/metadata.json", "r", encoding="utf-8") as mf:
+            metadata = _json.load(mf)
+        chunks3 = [m for m in metadata if m.get("source") == filename][:top_k]
+        if chunks3:
+            print(f"    [Map] {filename} → {len(chunks3)} chunks (L3 metadata scan)")
+            return chunks3
+    except Exception as e:
+        print(f"    [Map] {filename} → metadata scan failed: {e}")
+
+    print(f"    [Map] {filename} → 0 chunks (all levels failed)")
+    return []
+
+
 def map_reduce_answer(
     question: str,
     session_id: str,
@@ -267,76 +364,78 @@ def map_reduce_answer(
     top_k: int = 8,
 ) -> dict:
     """
-    Map-reduce retrieval and answering for cross-document questions.
+    Map-reduce for cross-document questions.
 
-    Instead of sending all chunks together (which causes cross-contamination),
-    this function:
-    1. MAP:    For each uploaded document, retrieve chunks from THAT document only
-               and ask GPT to answer from THAT document only
-    2. REDUCE: Ask GPT to merge all per-document answers into a final response
+    MAP:    For each uploaded document, retrieve chunks from THAT
+            document only and generate a per-document answer in
+            isolation — no other document's content is present.
 
-    This makes cross-contamination structurally impossible —
-    each map step is isolated to one document.
+    REDUCE: Merge all per-document answers into one final response.
+
+    This makes cross-contamination structurally impossible.
+    Each map GPT call sees only one document's content.
     """
     docs_dir = Path(f"docs/{session_id}")
     if not docs_dir.exists():
-        return {"answer": "No documents found.", "sources": [], "chunks": [], "mode": "cross_doc", "accuracy": 0}
+        return {"answer": "No documents found.", "sources": [],
+                "chunks": [], "mode": "cross_doc", "accuracy": 0}
 
-    uploaded_files = [f.name for f in docs_dir.iterdir() if f.is_file()]
+    uploaded_files = [f.name for f in sorted(docs_dir.iterdir()) if f.is_file()]
     if not uploaded_files:
-        return {"answer": "No documents uploaded.", "sources": [], "chunks": [], "mode": "cross_doc", "accuracy": 0}
+        return {"answer": "No documents uploaded.", "sources": [],
+                "chunks": [], "mode": "cross_doc", "accuracy": 0}
 
-    print(f"  [MapReduce] Processing {len(uploaded_files)} document(s)")
+    print(f"\n  [MapReduce] {len(uploaded_files)} document(s) | question: '{question[:60]}'")
 
-    # ── MAP phase: answer per document ────────────────────────────────────────
+    # ── MAP phase ─────────────────────────────────────────────────────────────
     per_doc_answers = []
-    all_chunks = []
+    all_chunks      = []
 
     for filename in uploaded_files:
-        # Retrieve chunks scoped to this document only
-        all_retrieved = retrieve(question, session_id=session_id, top_k=top_k)
-        doc_chunks = [c for c in all_retrieved if c.get("source") == filename]
-
-        if not doc_chunks:
-            # Force at least the first chunk from this document
-            all_retrieved_full = retrieve(filename, session_id=session_id, top_k=top_k * 2)
-            doc_chunks = [c for c in all_retrieved_full if c.get("source") == filename][:2]
+        doc_chunks = get_doc_chunks(session_id, filename, question, top_k)
 
         if not doc_chunks:
             per_doc_answers.append({
                 "filename": filename,
-                "answer": f"No relevant content found in {filename}.",
+                "answer":   f"[{filename}]: Could not retrieve content.",
             })
             continue
 
-        context = "\n\n".join(c["text"] for c in doc_chunks)
         all_chunks.extend(doc_chunks)
+        context = "\n\n".join(c["text"] for c in doc_chunks)
 
-        map_messages = build_messages_with_history(
-            system_prompt=f"Answer ONLY from this document: {filename}\n\n"
-                          f"Use ONLY the context below. If not found, say 'Not found in {filename}'.",
-            context=context,
-            question=question,
-            history=[],  # no history in map phase — keep each doc answer independent
+        map_system = (
+            f"You are reading ONE document: {filename}\n\n"
+            f"RULES:\n"
+            f"1. Use ONLY the content provided below — nothing else.\n"
+            f"2. The document belongs to one person. Find their name at the very top "
+            f"   (before email, phone, or any section heading).\n"
+            f"3. Answer the question as fully as possible from this document.\n"
+            f"4. If specific information is missing, say what IS present instead of 'Not found'.\n"
+            f"5. Be concise — 3-8 sentences maximum."
         )
+
+        map_messages = [
+            {"role": "system", "content": map_system},
+            {"role": "user",   "content": f"Document content:\n{context}\n\nQuestion: {question}"},
+        ]
 
         try:
             map_resp = client.chat.completions.create(
                 model=CHAT_MODEL,
                 messages=map_messages,
                 temperature=0.3,
-                max_tokens=800,
+                max_tokens=600,
             )
             doc_answer = map_resp.choices[0].message.content.strip()
+            print(f"    [Map] '{filename}' answered ({len(doc_answer)} chars)")
         except Exception as e:
             doc_answer = f"Error processing {filename}: {e}"
 
         per_doc_answers.append({"filename": filename, "answer": doc_answer})
-        print(f"  [MapReduce] Mapped {filename} → {len(doc_answer)} chars")
 
-    # ── REDUCE phase: merge all per-document answers ──────────────────────────
+    # ── REDUCE phase ──────────────────────────────────────────────────────────
     if len(per_doc_answers) == 1:
-        # Only one document — no need to reduce
         final_answer = per_doc_answers[0]["answer"]
     else:
         reduce_context = "\n\n".join(
@@ -344,11 +443,20 @@ def map_reduce_answer(
             for d in per_doc_answers
         )
 
-        # Include history in reduce phase so follow-ups work
+        reduce_system = (
+            "You are merging per-document answers into one final response.\n\n"
+            "RULES:\n"
+            "1. Each document's answer is under its === filename === header.\n"
+            "2. Combine them into a clear numbered list — one entry per document.\n"
+            "3. Do NOT add information not present in the per-document answers.\n"
+            "4. Do NOT skip any document — list all of them.\n"
+            "5. Keep the final answer clear and well-structured."
+        )
+
         reduce_messages = build_messages_with_history(
-            system_prompt=SYSTEM_PROMPT_CROSS_DOC,
+            system_prompt=reduce_system,
             context=reduce_context,
-            question=f"Combine the above per-document answers into a final response for: {question}",
+            question=f"Merge these per-document answers for: {question}",
             history=history,
         )
 
@@ -356,20 +464,21 @@ def map_reduce_answer(
             reduce_resp = client.chat.completions.create(
                 model=CHAT_MODEL,
                 messages=reduce_messages,
-                temperature=0.5,
+                temperature=0.4,
                 max_tokens=1500,
             )
             final_answer = reduce_resp.choices[0].message.content.strip()
-            print(f"  [MapReduce] Reduced → {len(final_answer)} chars")
+            print(f"    [Reduce] Final answer: {len(final_answer)} chars")
         except Exception as e:
             # Fallback: concatenate map answers
             final_answer = "\n\n".join(
-                f"**{d['filename']}:**\n{d['answer']}" for d in per_doc_answers
+                f"**{d['filename']}:**\n{d['answer']}"
+                for d in per_doc_answers
             )
+            print(f"    [Reduce] Failed ({e}), using concatenation fallback")
 
     # Deduplicate chunks for display
-    seen = set()
-    unique_chunks = []
+    seen, unique_chunks = set(), []
     for c in all_chunks:
         key = (c.get("source"), c.get("text", "")[:100])
         if key not in seen:
@@ -380,13 +489,16 @@ def map_reduce_answer(
         "answer":   final_answer,
         "mode":     "cross_doc",
         "sources":  uploaded_files,
-        "accuracy": avg_accuracy(unique_chunks) if unique_chunks else 60,
+        "accuracy": avg_accuracy(unique_chunks) if unique_chunks else 55,
         "chunks": [
             {
                 "source":   c.get("source", "Unknown"),
                 "text":     c["text"][:300],
                 "distance": c.get("distance"),
-                "accuracy": calculate_accuracy(c.get("distance", 1.0), c.get("cross_encoder_score")),
+                "accuracy": calculate_accuracy(
+                    c.get("distance", 1.0),
+                    c.get("cross_encoder_score")
+                ),
             }
             for c in unique_chunks[:8]
         ],

@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from query import retrieve, _is_cross_document_question
@@ -887,6 +888,176 @@ def ask_question(
             for c in chunks
         ],
     }
+
+
+# ── Streaming endpoint ───────────────────────────────────────────────────────
+
+@app.post("/api/ask/stream")
+async def ask_question_stream(
+    request: QuestionRequest,
+    x_session_id: Optional[str] = Header(None),
+):
+    """
+    Streaming version of /api/ask.
+
+    Returns a Server-Sent Events (SSE) stream so words appear one by one
+    as GPT generates them — exactly like ChatGPT.
+
+    SSE event format:
+      data: {"type": "token", "content": "word "}
+
+
+      data: {"type": "token", "content": "by "}
+
+
+      data: {"type": "token", "content": "word"}
+
+
+      data: {"type": "done", "mode": "...", "sources": [...],
+             "accuracy": 84, "is_followup": false}
+
+
+
+    The frontend reads tokens and appends them to the message bubble.
+    The final "done" event carries all metadata (mode, sources, accuracy).
+
+    Cross-doc (map-reduce) streams the reduce phase.
+    All other intents stream the final GPT answer directly.
+    """
+    if not x_session_id:
+        raise HTTPException(status_code=401, detail="No session ID.")
+
+    store_dir = Path(f"vector_store/{x_session_id}")
+    if not (store_dir / "index.faiss").exists():
+        async def no_docs():
+            import json as _j
+            yield "data: " + _j.dumps({"type": "token", "content": "No documents indexed yet. Please upload a document first."}) + "\n\n"
+            yield "data: " + _j.dumps({"type": "done", "mode": "none", "sources": [], "accuracy": 0, "is_followup": False}) + "\n\n"
+        return StreamingResponse(no_docs(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    history = [{"role": t.role, "content": t.content} for t in request.history]
+
+    async def generate():
+        import json
+
+        # ── Step 1: Classify intent ──────────────────────────────────────────
+        intent = classify_intent(request.question, history)
+        if request.mode and request.mode != "auto":
+            intent.type = request.mode
+
+        # ── Step 2: Out of scope ─────────────────────────────────────────────
+        if intent.type == "out_of_scope":
+            msg = "I can only answer questions about your uploaded documents."
+            yield "data: " + json.dumps({"type": "token", "content": msg}) + "\n\n"
+            yield "data: " + json.dumps({"type": "done", "mode": "out_of_scope", "sources": [], "accuracy": 0, "is_followup": False}) + "\n\n"
+            return
+
+        # ── Step 3: Cross-doc → map-reduce then stream the reduce phase ──────
+        if intent.type == "cross_doc":
+            # Run map phase (non-streaming, fast per-doc answers)
+            docs_dir = Path(f"docs/{x_session_id}")
+            uploaded_files = [f.name for f in sorted(docs_dir.iterdir()) if f.is_file()] if docs_dir.exists() else []
+
+            per_doc_answers = []
+            all_chunks = []
+
+            for filename in uploaded_files:
+                doc_chunks = get_doc_chunks(x_session_id, filename, request.question, get_top_k(intent.type, request.question))
+                if not doc_chunks:
+                    per_doc_answers.append({"filename": filename, "answer": f"[{filename}]: Could not retrieve content."})
+                    continue
+                all_chunks.extend(doc_chunks)
+                context = "\n\n".join(c["text"] for c in doc_chunks)
+                map_messages = [
+                    {"role": "system", "content": (
+                        f"You are reading ONE document: {filename}. "
+                        f"Answer ONLY from the content below. Be concise."
+                    )},
+                    {"role": "user", "content": f"Document content:\n{context}\n\nQuestion: {request.question}"},
+                ]
+                try:
+                    map_resp = client.chat.completions.create(
+                        model=CHAT_MODEL, messages=map_messages, temperature=0.3, max_tokens=600
+                    )
+                    per_doc_answers.append({"filename": filename, "answer": map_resp.choices[0].message.content.strip()})
+                except Exception as e:
+                    per_doc_answers.append({"filename": filename, "answer": f"Error: {e}"})
+
+            # Stream the reduce phase
+            reduce_context = "\n\n".join(f"=== {d['filename']} ===\n{d['answer']}" for d in per_doc_answers)
+            reduce_messages = build_messages_with_history(
+                system_prompt=(
+                    "Merge these per-document answers into one final response. "
+                    "List one entry per document. Do not skip any document."
+                ),
+                context=reduce_context,
+                question=f"Merge for: {request.question}",
+                history=history,
+            )
+
+            stream = client.chat.completions.create(
+                model=CHAT_MODEL, messages=reduce_messages,
+                temperature=0.4, max_tokens=1500, stream=True
+            )
+            for chunk in stream:
+                token = chunk.choices[0].delta.content
+                if token:
+                    yield "data: " + json.dumps({"type": "token", "content": token}) + "\n\n"
+
+            accuracy = avg_accuracy(all_chunks) if all_chunks else 55
+            yield "data: " + json.dumps({"type": "done", "mode": "cross_doc", "sources": uploaded_files, "accuracy": accuracy, "is_followup": intent.is_followup}) + "\n\n"
+            return
+
+        # ── Step 4: Standard retrieval + streaming answer ────────────────────
+        top_k  = get_top_k(intent.type, request.question)
+        chunks = retrieve(request.question, session_id=x_session_id, top_k=top_k)
+
+        if not chunks:
+            msg = "No relevant content found in your documents."
+            yield "data: " + json.dumps({"type": "token", "content": msg}) + "\n\n"
+            yield "data: " + json.dumps({"type": "done", "mode": intent.type, "sources": [], "accuracy": 0, "is_followup": False}) + "\n\n"
+            return
+
+        system_prompt   = get_system_prompt(intent.type)
+        context_content = build_context_prompt(request.question, chunks, intent.type)
+        messages = build_messages_with_history(
+            system_prompt=system_prompt,
+            context=context_content,
+            question=request.question,
+            history=history,
+        )
+
+        # Stream the answer token by token
+        full_answer = ""
+        stream = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            temperature=0.3 if intent.type in ("analyzer", "skill_gap") else 0.7,
+            max_tokens=1500,
+            stream=True,
+        )
+        for chunk in stream:
+            token = chunk.choices[0].delta.content
+            if token:
+                full_answer += token
+                yield "data: " + json.dumps({"type": "token", "content": token}) + "\n\n"
+
+        # After streaming completes, collect metadata
+        sources_seen, enriched_sources = set(), []
+        for c in chunks:
+            src = c.get("source", "Unknown")
+            if src not in sources_seen:
+                sources_seen.add(src)
+                enriched_sources.append(src)
+
+        yield "data: " + json.dumps({"type": "done", "mode": intent.type, "sources": enriched_sources, "accuracy": avg_accuracy(chunks), "is_followup": intent.is_followup}) + "\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── Dedicated endpoints (kept for backward compatibility) ────────────────────

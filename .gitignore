@@ -1,0 +1,24 @@
+# Environment
+.env
+.env.local
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# RAG data (user uploads and indexes)
+backend/docs/
+backend/vector_store/
+
+# Evaluation results
+evaluation/results/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

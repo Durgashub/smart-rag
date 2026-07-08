@@ -1,12 +1,12 @@
 """
-services/sessions.py — session directory helpers.
+services/sessions.py — session directory helpers + index existence check.
 
-All filesystem paths for a session live here.
-When switching to a database (Stage 5), only this file changes for
-file-listing logic; retrieval/store.py changes for index storage.
+Stage 5 update: has_index() now checks PostgreSQL instead of FAISS files.
+File storage (docs/) remains on Railway disk — only vectors moved to DB.
 """
 
 from pathlib import Path
+from retrieval.store import has_chunks
 
 
 def get_session_dirs(session_id: str) -> tuple[Path, Path]:
@@ -29,13 +29,11 @@ def get_files_for_session(session_id: str) -> list[dict]:
 
 
 def has_index(session_id: str) -> bool:
-    """Return True if a FAISS index exists for this session."""
-    return Path(f"vector_store/{session_id}/index.faiss").exists()
+    """Check PostgreSQL for chunks — replaces FAISS file existence check."""
+    return has_chunks(session_id)
 
 
 def delete_index(session_id: str) -> None:
-    """Delete all vector store files for a session (called when last file deleted)."""
-    store_dir = Path(f"vector_store/{session_id}")
-    if store_dir.exists():
-        for f in store_dir.iterdir():
-            f.unlink()
+    """Delete all chunks for this session from PostgreSQL."""
+    from ingestion.embeddings import delete_chunks_for_session
+    delete_chunks_for_session(session_id)

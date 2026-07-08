@@ -10,42 +10,27 @@ import json
 import re
 from pathlib import Path
 
-import numpy as np
-import faiss
-
-from config import client, CHAT_MODEL, EMBED_MODEL
+from config import client, CHAT_MODEL
 from services.accuracy import avg_accuracy, calculate_accuracy
 from services.generation import build_messages_with_history
+from retrieval.store import embed_query, search_chunks
 
 
 # ── Simple retrieval (bypasses Stage 3 pipeline) ─────────────────────────────
 
 def simple_retrieve(question: str, session_id: str, top_k: int = 20) -> list[dict]:
     """
-    Raw FAISS search — no rewriting, no HyDE, no MMR, no cross-encoder.
+    Raw pgvector search — no rewriting, no HyDE, no MMR, no cross-encoder.
 
     Used by the map phase to avoid HyDE hallucinating names like "Alex Johnson"
     for "who are the candidates?", which would poison per-document retrieval.
     """
-    store_dir = f"vector_store/{session_id}"
     try:
-        index = faiss.read_index(f"{store_dir}/index.faiss")
-        with open(f"{store_dir}/metadata.json", "r", encoding="utf-8") as mf:
-            metadata = json.load(mf)
+        query_vec = embed_query(question)
+        return search_chunks(session_id, query_vec, top_k=top_k)
     except Exception as e:
         print(f"    [SimpleRetrieve] Failed: {e}")
         return []
-
-    resp      = client.embeddings.create(model=EMBED_MODEL, input=[question])
-    query_vec = np.array([resp.data[0].embedding], dtype="float32")
-    k         = min(top_k, len(metadata))
-    distances, indices = index.search(query_vec, k)
-
-    return [
-        {**metadata[idx], "distance": float(dist)}
-        for idx, dist in zip(indices[0], distances[0])
-        if idx != -1 and idx < len(metadata)
-    ]
 
 
 # ── Per-document chunk retrieval ─────────────────────────────────────────────

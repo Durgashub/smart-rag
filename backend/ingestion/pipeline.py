@@ -2,23 +2,22 @@
 ingestion/pipeline.py — ingest_session() orchestrating full document ingestion.
 
 Reads from:  docs/<session_id>/
-Writes to:   vector_store/<session_id>/
+Writes to:   PostgreSQL chunks table (replaced FAISS in Stage 5)
 
-Called by ingest.py (the CLI wrapper that server.py subprocess-calls on upload).
+Called by ingest.py (subprocess from routers/files.py on upload).
 """
 
 import glob
 from pathlib import Path
 
-from ingestion.loaders  import load_text_from_file
-from ingestion.chunking import build_parent_child_chunks, chunk_into_parents, is_low_value_chunk
-from ingestion.embeddings import embed_texts, save_to_faiss
+from ingestion.loaders    import load_text_from_file
+from ingestion.chunking   import build_parent_child_chunks, chunk_into_parents
+from ingestion.embeddings import embed_texts, save_to_postgres
 from config import SUPPORTED_EXTENSIONS
 
 
 def ingest_session(session_id: str) -> None:
-    docs_dir  = f"docs/{session_id}"
-    store_dir = f"vector_store/{session_id}"
+    docs_dir = f"docs/{session_id}"
 
     all_files  = glob.glob(f"{docs_dir}/**/*.*", recursive=True)
     file_paths = [p for p in all_files if Path(p).suffix.lower() in SUPPORTED_EXTENSIONS]
@@ -61,8 +60,8 @@ def ingest_session(session_id: str) -> None:
             all_child_texts.append(pair["child_text"])
             metadata.append({
                 "source":     Path(path).name,
-                "text":       pair["parent_text"],   # GPT gets the full parent
-                "child_text": pair["child_text"],     # cross-encoder + debug
+                "text":       pair["parent_text"],
+                "child_text": pair["child_text"],
                 "parent_id":  pair["parent_id"],
             })
 
@@ -71,11 +70,12 @@ def ingest_session(session_id: str) -> None:
         return
 
     print(f"\nTotal: {total_parents} parents → {total_children} children across {len(file_paths)} file(s)")
-    print(f"Embedding {len(all_child_texts)} child chunks (used for retrieval)...")
+    print(f"Embedding {len(all_child_texts)} child chunks...")
 
     embeddings = embed_texts(all_child_texts)
-    save_to_faiss(session_id, embeddings, metadata)
 
-    print(f"Done. Index saved to '{store_dir}/'.")
-    print(f"  Child chunks indexed: {len(all_child_texts)}")
+    # Save to PostgreSQL instead of FAISS
+    save_to_postgres(session_id, embeddings, metadata)
+
+    print(f"Done. {len(all_child_texts)} chunks saved to PostgreSQL.")
     print(f"  GPT will receive parent chunks for richer answers.")

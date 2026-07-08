@@ -15,3 +15,5 @@ python-pptx>=0.6.21
 sentence-transformers>=2.7.0
 langchain-community<0.4.2
 ragas>=0.1.0
+psycopg2-binary>=2.9.9
+pgvector>=0.3.0

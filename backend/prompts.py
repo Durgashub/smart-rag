@@ -23,6 +23,13 @@ Conversation awareness:
 - When a follow-up refers to something said earlier, find it in the history.
 - If a follow-up is ambiguous, ask one clarifying question.
 
+File type questions:
+- Each context chunk is labeled with "[Source file: filename.ext]".
+- If asked what file type a document is, read the filename extension directly
+  from this label (e.g., .pptx = PowerPoint presentation, .csv = CSV spreadsheet,
+  .xlsx = Excel spreadsheet, .docx = Word document, .pdf = PDF, .txt = plain text,
+  .md = Markdown file). Never guess the file type from content structure alone.
+
 Citation format — end every answer with:
 Sources:
 - <document_name> (page X if known)
@@ -156,8 +163,16 @@ def get_system_prompt(intent_type: str) -> str:
 
 
 def build_context_prompt(question: str, chunks: list[dict], intent_type: str) -> str:
-    """Format retrieved chunks into the user message content sent to GPT."""
-    context = "\n\n---\n\n".join(c["text"] for c in chunks)
+    """Format retrieved chunks into the user message content sent to GPT.
+
+    Each chunk is labeled with its source filename (including extension)
+    so GPT can accurately answer questions like "what file type is this?"
+    instead of guessing from content structure alone.
+    """
+    context = "\n\n---\n\n".join(
+        f"[Source file: {c.get('source', 'Unknown')}]\n{c['text']}"
+        for c in chunks
+    )
     if intent_type == "analyzer":
         return f"Resume Content:\n{context}\n\nTask: {question}\n\nAnalyze thoroughly."
     if intent_type == "cover_letter":

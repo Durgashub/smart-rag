@@ -103,7 +103,7 @@ def search_chunks(
         WHERE session_id = %s
         ORDER BY distance
         LIMIT %s
-    """, (query_embedding.tolist(), session_id, top_k))
+    """, (query_embedding, session_id, top_k))
     rows = cur.fetchall()
     cur.close()
     conn.close()

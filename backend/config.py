@@ -10,8 +10,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# Load .env from the same directory as this file — works regardless of
-# which directory uvicorn is launched from
+# Load .env from the same directory as this file
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 # ── OpenAI client (shared singleton) ─────────────────────────────────────────
@@ -22,37 +21,39 @@ CHAT_MODEL  = "gpt-4.1-mini"
 EMBED_MODEL = "text-embedding-3-small"
 
 # ── Conversation memory ───────────────────────────────────────────────────────
-MAX_HISTORY_TURNS = 10          # last N Q&A pairs kept in context
+MAX_HISTORY_TURNS = 10
 
 # ── Chunking ──────────────────────────────────────────────────────────────────
-PARENT_CHUNK_SIZE      = 1200   # sent to GPT for richer answers
-CHILD_CHUNK_SIZE       = 400    # embedded for retrieval + cross-encoder
-CHILD_OVERLAP          = 50     # overlap between child chunks
-CHUNK_OVERLAP          = 200    # overlap between parent chunks
-MIN_TEXT_LEN_BEFORE_OCR = 20   # pages below this char count trigger OCR
+PARENT_CHUNK_SIZE      = 1200
+CHILD_CHUNK_SIZE       = 400
+CHILD_OVERLAP          = 50
+CHUNK_OVERLAP          = 200
+MIN_TEXT_LEN_BEFORE_OCR = 20
 
 # ── Retrieval ─────────────────────────────────────────────────────────────────
 DEFAULT_TOP_K = 6
-RRF_K         = 60              # Reciprocal Rank Fusion constant
+RRF_K         = 60
 
 # ── Cross-encoder ─────────────────────────────────────────────────────────────
 CROSS_ENCODER_MODEL       = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-CROSS_ENCODER_NOISE_FLOOR = -5.0  # scores below → fall back to FAISS distance
+CROSS_ENCODER_NOISE_FLOOR = -5.0
 
 # ── Accuracy display ──────────────────────────────────────────────────────────
-FAISS_MIN_DIST = 0.3            # → 92% accuracy
-FAISS_MAX_DIST = 1.5            # → 46% accuracy
+FAISS_MIN_DIST = 0.3
+FAISS_MAX_DIST = 1.5
 
 # ── OCR ───────────────────────────────────────────────────────────────────────
-TESSERACT_CMD = os.getenv("TESSERACT_CMD")   # Windows path override
-POPPLER_PATH  = os.getenv("POPPLER_PATH")    # Windows path override
+TESSERACT_CMD = os.getenv("TESSERACT_CMD")
+POPPLER_PATH  = os.getenv("POPPLER_PATH")
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
+# IMPORTANT: update this list every time the frontend URL changes
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "https://chat-smart.lovable.app",
+    "https://dociq.up.railway.app",
 ]
-ALLOWED_ORIGIN_REGEX = r"https://.*\.lovable\.app|https://.*\.lovableproject\.com"
+ALLOWED_ORIGIN_REGEX = r"https://.*\.lovable\.app|https://.*\.lovableproject\.com|https://.*\.up\.railway\.app"
 
 # ── Supported file types ──────────────────────────────────────────────────────
 SUPPORTED_EXTENSIONS = {
